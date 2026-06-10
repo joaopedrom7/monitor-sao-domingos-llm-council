@@ -1,0 +1,11 @@
+streamlit>=1.40
+requests>=2.31
+# Extracao de ficheiros
+pymupdf>=1.24        # PDF (texto + render p/ OCR)
+python-pptx>=0.6.23  # PPTX
+pillow>=10.0         # imagens
+pytesseract>=0.3.10  # OCR (requer binario 'tesseract-ocr' no sistema)
+numpy>=1.26
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+torch>=2.2
