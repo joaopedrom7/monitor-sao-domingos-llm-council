@@ -47,7 +47,7 @@ from pathlib import Path
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-
+st.set_page_config(page_icon="Gemini_Generated_Image_o58khxo58khxo58k.png")
 # ---------------------------------------------------------------------------
 # Dependencias opcionais (extracao/OCR) - degradacao graciosa se faltarem
 # ---------------------------------------------------------------------------
