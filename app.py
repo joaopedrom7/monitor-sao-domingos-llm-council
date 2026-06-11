@@ -1,20 +1,36 @@
 """
-Claude x GPT - Roteador Inteligente (IAedu)
-================================================
-Roteia cada pedido para o modelo mais forte (Claude Opus 4.7 vs GPT-5.5),
-com modos Duelo e Colaboracao. Inclui:
+TIC Copilot — Claude x GPT (IAedu)
+==================================================================
+Assistente multi-modelo para o Technical Innovation Center (CAD,
+3D Printing, 3D Reality, Mendix). Roteia cada pedido para o modelo
+mais forte (Claude Opus 4.7 vs GPT-5.5), com modos Duelo e
+Colaboracao. Inclui:
+
   - Login com password (PBKDF2, stdlib)
-  - Memoria "master" por utilizador (resumo persistente do perfil + temas passados)
-  - Upload de PDF / PPTX / imagem (com OCR) + RAG com embeddings
+  - HISTORICO de conversas persistente por utilizador (criar /
+    retomar / apagar / exportar para Markdown)
+  - Memoria "master" por utilizador (resumo persistente do perfil)
+  - Upload de PDF / PPTX / imagem
+  - OCR (tesseract) + VLM gratuito (Hugging Face router) para
+    interpretar imagens (diagramas, pecas, screenshots Mendix...)
+  - RAG HIBRIDO estado-da-arte: BM25 + embeddings densos (FAISS)
+    fundidos por Reciprocal Rank Fusion + reranker neural opcional
+  - PESQUISA WEB (DuckDuckGo, sem chave) com leitura das paginas
+  - ENTRADA POR VOZ: gravacao no browser + speech-to-text local
+    (faster-whisper, gratuito)
+  - Acoes rapidas TIC, dashboard de custos da sessao
 
 Correr:
   pip install -r requirements.txt
-  # OCR precisa do binario do sistema:  sudo apt-get install tesseract-ocr tesseract-ocr-por
+  # OCR precisa do binario do sistema:
+  #   sudo apt-get install tesseract-ocr tesseract-ocr-por
+  # VLM (opcional): define HF_TOKEN (token gratuito de huggingface.co)
   streamlit run app.py
 """
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hashlib
 import hmac
@@ -64,7 +80,7 @@ except Exception:
     HAS_OCR = False
 
 # ---------------------------------------------------------------------------
-# Dependencias opcionais para RAG com embeddings
+# Dependencias opcionais para RAG hibrido
 # ---------------------------------------------------------------------------
 try:
     import numpy as np
@@ -88,6 +104,37 @@ except Exception:
     CrossEncoder = None
     HAS_SENTENCE_TRANSFORMERS = False
 
+try:
+    from rank_bm25 import BM25Okapi
+    HAS_BM25 = True
+except Exception:
+    BM25Okapi = None
+    HAS_BM25 = False
+
+# ---------------------------------------------------------------------------
+# Dependencias opcionais: pesquisa web (DuckDuckGo, sem chave de API)
+# ---------------------------------------------------------------------------
+HAS_DDG = False
+try:
+    from ddgs import DDGS
+    HAS_DDG = True
+except Exception:
+    try:
+        from duckduckgo_search import DDGS
+        HAS_DDG = True
+    except Exception:
+        DDGS = None
+
+# ---------------------------------------------------------------------------
+# Dependencias opcionais: speech-to-text local (faster-whisper)
+# ---------------------------------------------------------------------------
+try:
+    from faster_whisper import WhisperModel
+    HAS_WHISPER = True
+except Exception:
+    WhisperModel = None
+    HAS_WHISPER = False
+
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 USERS_FILE = APP_DIR / "users.json"
@@ -97,14 +144,15 @@ PER_FILE_CAP = 20000
 TOTAL_CAP = 40000
 SESSION_TRANSCRIPT_CAP = 24000  # janela maxima da conversa atual enviada aos modelos
 MEMORY_UPDATE_EVERY = 3   # turnos entre atualizacoes automaticas da memoria
+MAX_CONVERSATIONS_LISTED = 18
 
-# RAG com embeddings para anexos grandes/persistentes da sessao
-ATTACHMENT_SEARCH_TRIGGER = 8000
+# RAG hibrido para anexos grandes/persistentes da sessao
 ATTACHMENT_CHUNK_SIZE = 1800
 ATTACHMENT_CHUNK_OVERLAP = 250
 ATTACHMENT_CONTEXT_CAP = 36000
 ATTACHMENT_TOP_K_DEFAULT = 6
 ATTACHMENT_CANDIDATE_MULTIPLIER = 6
+RRF_K = 60  # constante classica do Reciprocal Rank Fusion
 EMBEDDING_MODEL_OPTIONS = [
     "BAAI/bge-m3",
     "intfloat/multilingual-e5-large-instruct",
@@ -115,8 +163,22 @@ RERANKER_MODEL_OPTIONS = [
     "cross-encoder/ms-marco-MiniLM-L-6-v2",
 ]
 
+# Pesquisa web
+WEB_MAX_RESULTS = 6
+WEB_FETCH_PAGES = 2
+WEB_PAGE_CAP = 4500
+WEB_CONTEXT_CAP = 16000
+
+# VLM gratuito (Hugging Face Inference Router - token gratuito chega)
+HF_VLM_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+HF_ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
+
+# Speech-to-text
+WHISPER_SIZES = ["tiny", "base", "small"]
+WHISPER_DEFAULT = "base"
+
 # ---------------------------------------------------------------------------
-# Configuracao dos dois agentes (do notebook IA_EDU.ipynb)
+# Configuracao dos dois agentes (IAedu)
 # ---------------------------------------------------------------------------
 MODELS = {
     "claude": {
@@ -134,7 +196,7 @@ MODELS = {
 }
 
 # ---------------------------------------------------------------------------
-# Regras de roteamento (derivadas do comparativo Opus 4.7 vs GPT-5.5)
+# Regras de roteamento (benchmarks Opus 4.7 vs GPT-5.5 + dominio TIC)
 # ---------------------------------------------------------------------------
 ROUTING_RULES = [
     {"id": "terminal", "model": "gpt", "label": "Agentes de terminal / CLI / DevOps",
@@ -144,9 +206,10 @@ ROUTING_RULES = [
                   "pipeline ci", "cron", "ansible", "makefile"]},
     {"id": "web", "model": "gpt", "label": "Pesquisa web / browsing / info atual",
      "bench": "BrowseComp - 90.1% (Pro) vs 79.3%",
-     "keywords": ["pesquisa web", "pesquisar na web", "browse", "navegar", "internet",
-                  "noticias", "notícias", "atual", "ultimo", "último", "recente", "cotacao",
-                  "cotação", "preco atual", "preço atual", "search the web", "google", "hoje em dia"]},
+     "keywords": ["pesquisa web", "pesquisar na web", "pesquisa na internet", "browse", "navegar",
+                  "internet", "noticias", "notícias", "atual", "ultimo", "último", "recente",
+                  "cotacao", "cotação", "preco atual", "preço atual", "search the web", "google",
+                  "hoje em dia", "lancamento", "lançamento", "novidades"]},
     {"id": "longcontext", "model": "gpt", "label": "Contexto longo (>128K tokens)",
      "bench": "MRCR v2 512K-1M - 74.0% vs 32.2%",
      "keywords": ["contexto longo", "documento inteiro", "monorepo", "corpus", "ficheiro gigante",
@@ -166,6 +229,27 @@ ROUTING_RULES = [
      "bench": "OfficeQA Pro - 54.1% vs 43.6%  ·  GDPval 84.9% vs 80.3%",
      "keywords": ["powerpoint", "slides", "excel", "folha de calculo", "folha de cálculo",
                   "relatorio de escritorio", "memorando", "ata", "documento word"]},
+    {"id": "mendix", "model": "claude", "label": "Mendix / low-code / arquitetura de apps",
+     "bench": "SWE-Bench Pro - forte em codigo e arquitetura",
+     "keywords": ["mendix", "low-code", "lowcode", "low code", "microflow", "nanoflow",
+                  "domain model", "modelo de dominio", "entidade mendix", "modulo mendix",
+                  "workflow", "xpath", "ocl", "arquitetura da aplicacao",
+                  "arquitetura da aplicação", "logica de negocio", "lógica de negócio",
+                  "alocacao automatica", "alocação automática", "regras de negocio"]},
+    {"id": "cad3d", "model": "claude", "label": "CAD / Impressao 3D / 3D Reality",
+     "bench": "Raciocinio tecnico profundo de engenharia",
+     "keywords": ["cad", "catia", "solidworks", "autocad", "nx", "creo", "impressao 3d",
+                  "impressão 3d", "impressora 3d", "stl", "step", "g-code", "gcode", "fdm",
+                  "sla", "sls", "slicer", "tolerancia", "tolerância", "peca", "peça",
+                  "prototipo", "protótipo", "realidade aumentada", "realidade virtual",
+                  "ar/vr", "digital twin", "gemeo digital", "gémeo digital", "scan 3d"]},
+    {"id": "leadership", "model": "claude", "label": "Lideranca / gestao de equipas",
+     "bench": "Escrita e raciocinio organizacional",
+     "keywords": ["lideranca", "liderança", "equipa", "gestao de equipa", "gestão de equipa",
+                  "chefiar", "reuniao", "reunião", "one-on-one", "feedback", "onboarding",
+                  "organizacao do departamento", "organização do departamento", "kpi", "kpis",
+                  "okr", "delegar", "motivar", "avaliacao de desempenho",
+                  "avaliação de desempenho"]},
     {"id": "pr_code", "model": "claude", "label": "Resolucao de PRs / refactor / codebase",
      "bench": "SWE-Bench Pro - 64.3% vs 58.6%",
      "keywords": ["bug", "corrige", "fix", "refactor", "refatora", "pull request", "code review",
@@ -181,7 +265,8 @@ ROUTING_RULES = [
      "bench": "FinanceAgent v1.1 - 64.4% vs 60.0%",
      "keywords": ["financeiro", "financas", "finanças", "investimento", "balanco", "balanço",
                   "dcf", "valuation", "fluxo de caixa", "acoes", "ações", "portfolio", "portfólio",
-                  "analise financeira", "demonstracoes financeiras"]},
+                  "analise financeira", "demonstracoes financeiras", "orcamento", "orçamento",
+                  "custo por peca", "custo por peça"]},
     {"id": "academic", "model": "claude", "label": "Raciocinio academico profundo",
      "bench": "Humanity's Last Exam - 54.7% vs 52.2% (c/ ferramentas)",
      "keywords": ["tese", "paper", "artigo cientifico", "artigo científico", "investigacao",
@@ -194,6 +279,26 @@ DEFAULT_MODEL = "claude"
 DEFAULT_REASON = ("Sem sinal forte de categoria &mdash; Claude por defeito "
                   "(saida ~17% mais barata e forte em raciocinio geral / codigo).")
 LONG_INPUT_CHARS = 6000
+
+# Acoes rapidas para o contexto TIC (Autoeuropa)
+QUICK_ACTIONS = [
+    ("Mendix: alocacao automatica",
+     "Estou a desenvolver em Mendix a logica de alocacao automatica de tecnico responsavel e "
+     "impressora 3D para pedidos de impressao de pecas, otimizando o tempo de espera. Propoe a "
+     "arquitetura (domain model, microflows, filas de prioridade) e a logica de negocio passo a passo."),
+    ("Otimizar fila de impressao 3D",
+     "Como devo modelar e otimizar a fila de pedidos de impressao 3D do departamento (varias "
+     "impressoras, materiais e prioridades diferentes) para minimizar tempos de espera? Inclui "
+     "algoritmos praticos e como implementa-los em Mendix."),
+    ("Estruturar o departamento TIC",
+     "Vou chefiar um novo departamento TIC que agrega CAD, 3D Printing e 3D Reality. Ajuda-me a "
+     "estruturar a equipa, definir responsabilidades, KPIs e rituais de gestao (reunioes, "
+     "prioritizacao de pedidos)."),
+    ("Rever requisitos da app",
+     "Faz uma revisao critica dos requisitos da minha aplicacao de gestao de pedidos CAD/3D "
+     "(alocacao automatica de tecnico e impressora, otimizacao do tempo de espera): lacunas, "
+     "casos extremos e melhorias."),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -334,8 +439,170 @@ def summarize_memory(username: str):
 
 
 # ---------------------------------------------------------------------------
-# Extracao de ficheiros (PDF / PPTX / imagem + OCR)
+# Historico de conversas (persistente por utilizador)
 # ---------------------------------------------------------------------------
+def _conv_dir(username: str) -> Path:
+    d = _user_dir(username) / "conversations"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def list_conversations(username: str) -> list[dict]:
+    items = []
+    for f in _conv_dir(username).glob("*.json"):
+        try:
+            d = json.loads(f.read_text("utf-8"))
+            items.append({"id": d.get("id", f.stem),
+                          "title": d.get("title", "(sem titulo)"),
+                          "updated": d.get("updated", ""),
+                          "n": len(d.get("messages", []))})
+        except Exception:
+            continue
+    items.sort(key=lambda x: x.get("updated", ""), reverse=True)
+    return items
+
+
+def save_current_conversation(username: str):
+    """Grava a conversa atual em disco (chamado apos cada turno)."""
+    msgs = st.session_state.get("messages", [])
+    if not msgs:
+        return
+    cid = st.session_state.get("conv_id")
+    if not cid:
+        cid = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+        st.session_state.conv_id = cid
+    title = st.session_state.get("conv_title")
+    if not title:
+        first = next((m.get("content", "") for m in msgs if m.get("role") == "user"), "Conversa")
+        first = " ".join(first.split())
+        title = (first[:64] + "...") if len(first) > 64 else (first or "Conversa")
+        st.session_state.conv_title = title
+    created = st.session_state.get("conv_created") or dt.datetime.now().isoformat(timespec="seconds")
+    st.session_state.conv_created = created
+    data = {
+        "id": cid, "title": title, "created": created,
+        "updated": dt.datetime.now().isoformat(timespec="seconds"),
+        "messages": msgs,
+        "threads": st.session_state.get("threads", {}),
+        "rag_docs": [{"name": d.get("name"), "text": d.get("text"), "hash": d.get("hash")}
+                     for d in st.session_state.get("rag_docs", [])],
+    }
+    try:
+        (_conv_dir(username) / f"{cid}.json").write_text(
+            json.dumps(data, ensure_ascii=False), "utf-8")
+    except Exception:
+        pass
+
+
+def load_conversation(username: str, cid: str) -> bool:
+    f = _conv_dir(username) / f"{cid}.json"
+    if not f.exists():
+        return False
+    try:
+        d = json.loads(f.read_text("utf-8"))
+    except Exception:
+        return False
+    st.session_state.messages = d.get("messages", [])
+    threads = d.get("threads", {}) or {}
+    st.session_state.threads = {k: threads.get(k) or new_thread_id() for k in MODELS}
+    st.session_state.conv_id = d.get("id", cid)
+    st.session_state.conv_title = d.get("title", "")
+    st.session_state.conv_created = d.get("created")
+    st.session_state.rag_docs = d.get("rag_docs", []) or []
+    st.session_state.rag_doc_hashes = {x.get("hash") for x in st.session_state.rag_docs if x.get("hash")}
+    st.session_state.uploader_key = st.session_state.get("uploader_key", 0) + 1
+    return True
+
+
+def delete_conversation(username: str, cid: str):
+    f = _conv_dir(username) / f"{cid}.json"
+    try:
+        f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def conversation_markdown() -> str:
+    """Exporta a conversa atual para Markdown."""
+    lines = [f"# {st.session_state.get('conv_title') or 'Conversa'}",
+             f"_Exportado em {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}_", ""]
+    for msg in st.session_state.get("messages", []):
+        if msg.get("role") == "user":
+            lines.append("## Pedido")
+            lines.append(msg.get("content", ""))
+            if msg.get("attachments"):
+                lines.append("*Anexos: " + ", ".join(msg["attachments"]) + "*")
+        else:
+            mode = msg.get("mode")
+            if mode == "single":
+                lines.append(f"## Resposta ({MODELS.get(msg.get('model', ''), {}).get('label', '?')})")
+                lines.append(msg.get("content", ""))
+            elif mode == "duel":
+                lines.append("## Duelo")
+                lines.append("### Claude\n" + msg.get("data", {}).get("claude", ""))
+                lines.append("### GPT\n" + msg.get("data", {}).get("gpt", ""))
+            elif mode == "collab":
+                lines.append("## Colaboracao")
+                lines.append("### Rascunho\n" + msg.get("draft", ""))
+                lines.append("### Revisao\n" + msg.get("critique", ""))
+                if msg.get("synthesis"):
+                    lines.append("### Versao final\n" + msg.get("synthesis", ""))
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Extracao de ficheiros (PDF / PPTX / imagem) + OCR + VLM
+# ---------------------------------------------------------------------------
+def hf_token() -> str | None:
+    """Token gratuito do Hugging Face (HF_TOKEN) para o VLM."""
+    tok = os.getenv("HF_TOKEN")
+    if tok:
+        return tok.strip()
+    try:
+        if "HF_TOKEN" in st.secrets:
+            return str(st.secrets["HF_TOKEN"]).strip()
+    except Exception:
+        pass
+    return None
+
+
+def describe_image_vlm(data: bytes, prompt: str = "", mime: str = "image/png") -> str | None:
+    """Interpreta a imagem com um VLM gratuito (Hugging Face router).
+
+    Devolve None se nao houver token ou se a chamada falhar — o chamador
+    deve degradar para OCR.
+    """
+    token = hf_token()
+    if not token:
+        return None
+    instr = ("Descreve esta imagem em PT-PT de forma tecnica e util: o que mostra, "
+             "texto visivel, diagramas, medidas, e qualquer detalhe relevante para "
+             "engenharia (CAD, impressao 3D, Mendix, esquemas).")
+    if prompt:
+        instr += f"\nContexto do pedido do utilizador: {prompt[:500]}"
+    b64 = base64.b64encode(data).decode()
+    payload = {
+        "model": HF_VLM_MODEL,
+        "max_tokens": 700,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                {"type": "text", "text": instr},
+            ],
+        }],
+    }
+    try:
+        r = requests.post(HF_ROUTER_URL, json=payload, timeout=90,
+                          headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        out = r.json()["choices"][0]["message"]["content"]
+        return (out or "").strip() or None
+    except Exception:
+        return None
+
+
 def ocr_image(img) -> str:
     if img.mode != "RGB":
         img = img.convert("RGB")
@@ -384,13 +651,123 @@ def extract_pptx(data: bytes) -> str:
     return "\n\n".join(out)
 
 
-def extract_image(data: bytes) -> str:
-    if not HAS_OCR:
-        return "(OCR indisponivel - instala 'tesseract-ocr' e pillow)"
-    return ocr_image(Image.open(io.BytesIO(data))).strip()
+def extract_image(data: bytes, ext: str, query: str = "", use_vlm: bool = True) -> str:
+    """OCR + interpretacao por VLM (quando disponivel) — combina os dois."""
+    parts = []
+    if use_vlm:
+        mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{'png' if ext == 'png' else ext}"
+        desc = describe_image_vlm(data, prompt=query, mime=mime)
+        if desc:
+            parts.append("[INTERPRETACAO VLM]\n" + desc)
+    if HAS_OCR:
+        try:
+            txt = ocr_image(Image.open(io.BytesIO(data))).strip()
+            if txt:
+                parts.append("[TEXTO OCR]\n" + txt)
+        except Exception:
+            pass
+    if not parts:
+        return ("(Sem interpretacao: instala 'tesseract-ocr' para OCR e/ou define "
+                "HF_TOKEN para o VLM gratuito.)")
+    return "\n\n".join(parts)
 
 
 IMG_EXTS = ("png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif")
+
+
+# ---------------------------------------------------------------------------
+# Pesquisa web (DuckDuckGo, sem chave) + leitura de paginas
+# ---------------------------------------------------------------------------
+_TAG_RE = re.compile(r"<(script|style|noscript)[^>]*>.*?</\1>", re.S | re.I)
+_HTML_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(html: str) -> str:
+    html = _TAG_RE.sub(" ", html)
+    text = _HTML_RE.sub(" ", html)
+    text = re.sub(r"&nbsp;|&amp;|&lt;|&gt;|&quot;|&#\d+;", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _fetch_page_text(url: str, cap: int = WEB_PAGE_CAP) -> str:
+    try:
+        r = requests.get(url, timeout=12, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; TICCopilot/1.0)"})
+        r.raise_for_status()
+        ctype = r.headers.get("content-type", "")
+        if "html" not in ctype and "text" not in ctype:
+            return ""
+        return _strip_html(r.text)[:cap]
+    except Exception:
+        return ""
+
+
+def web_search_context(query: str, max_results: int = WEB_MAX_RESULTS,
+                       fetch_pages: int = WEB_FETCH_PAGES) -> tuple[str, list[dict]]:
+    """Pesquisa DuckDuckGo + leitura das primeiras paginas. Devolve (bloco, fontes)."""
+    if not HAS_DDG:
+        return "", []
+    try:
+        with DDGS() as ddg:
+            results = list(ddg.text(query, max_results=max_results, region="pt-pt"))
+    except Exception:
+        try:
+            with DDGS() as ddg:
+                results = list(ddg.text(query, max_results=max_results))
+        except Exception:
+            return "", []
+    if not results:
+        return "", []
+
+    sources, parts = [], [
+        "[RESULTADOS DA PESQUISA WEB - " + dt.datetime.now().strftime("%Y-%m-%d %H:%M") + "]",
+        f"Pesquisa: {query}",
+        "Usa estes resultados como evidencia atual; cita as fontes pelo numero [n].",
+    ]
+    used = 0
+    for n, r in enumerate(results, 1):
+        title = r.get("title", "")
+        url = r.get("href") or r.get("url") or ""
+        snippet = r.get("body", "")
+        sources.append({"n": n, "title": title, "url": url})
+        block = f"\n--- FONTE [{n}] {title}\nURL: {url}\nResumo: {snippet}"
+        if n <= fetch_pages and url:
+            page = _fetch_page_text(url)
+            if page:
+                block += f"\nConteudo da pagina:\n{page}"
+        if used + len(block) > WEB_CONTEXT_CAP:
+            break
+        parts.append(block)
+        used += len(block)
+    parts.append("[FIM RESULTADOS WEB]")
+    return "\n".join(parts), sources
+
+
+# ---------------------------------------------------------------------------
+# Speech-to-text local (faster-whisper, gratuito)
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def load_whisper(size: str = WHISPER_DEFAULT):
+    if not HAS_WHISPER:
+        raise RuntimeError("faster-whisper nao instalado: pip install faster-whisper")
+    return WhisperModel(size, device="cpu", compute_type="int8")
+
+
+def transcribe_audio(audio_bytes: bytes, size: str = WHISPER_DEFAULT) -> str:
+    model = load_whisper(size)
+    segments, _info = model.transcribe(io.BytesIO(audio_bytes), language=None,
+                                       vad_filter=True, beam_size=5)
+    return " ".join(s.text.strip() for s in segments).strip()
+
+
+# ---------------------------------------------------------------------------
+# RAG HIBRIDO: BM25 + embeddings densos (FAISS) + RRF + reranker opcional
+# ---------------------------------------------------------------------------
+_WORD_RE = re.compile(r"[0-9a-zà-öø-ÿ_]+", re.I)
+
+
+def _tokenize(text: str) -> list[str]:
+    return _WORD_RE.findall((text or "").lower())
 
 
 def _normalize_vecs(x):
@@ -411,8 +788,7 @@ def load_embedding_model(model_name: str):
     if not HAS_SENTENCE_TRANSFORMERS:
         raise RuntimeError(
             "sentence-transformers nao esta instalado. Instala com: "
-            "pip install sentence-transformers"
-        )
+            "pip install sentence-transformers")
     return SentenceTransformer(model_name)
 
 
@@ -422,13 +798,11 @@ def load_reranker_model(model_name: str):
     if not HAS_SENTENCE_TRANSFORMERS:
         raise RuntimeError(
             "sentence-transformers nao esta instalado. Instala com: "
-            "pip install sentence-transformers"
-        )
+            "pip install sentence-transformers")
     return CrossEncoder(model_name)
 
 
 def _embed_documents(model, texts: list[str]):
-    """Gera embeddings de documentos/chunks, usando APIs especializadas quando existem."""
     if hasattr(model, "encode_document"):
         try:
             return _normalize_vecs(model.encode_document(texts, convert_to_numpy=True, show_progress_bar=False))
@@ -441,7 +815,6 @@ def _embed_documents(model, texts: list[str]):
 
 
 def _embed_query(model, query: str):
-    """Gera embedding da pergunta, usando APIs especializadas quando existem."""
     if hasattr(model, "encode_query"):
         try:
             return _normalize_vecs(model.encode_query([query], convert_to_numpy=True, show_progress_bar=False))
@@ -463,7 +836,6 @@ def _split_text_chunks(text: str, chunk_size: int = ATTACHMENT_CHUNK_SIZE,
     start = 0
     while start < len(text):
         end = min(len(text), start + chunk_size)
-        # Tenta terminar numa fronteira natural para preservar frases/tabelas.
         if end < len(text):
             cut_candidates = [
                 text.rfind("\n\n", start, end),
@@ -500,7 +872,7 @@ def _ensure_session_rag_docs():
 
 
 def add_docs_to_session_rag(docs: list[dict]) -> int:
-    """Adiciona documentos extraidos ao índice lógico da sessão, evitando duplicados."""
+    """Adiciona documentos extraidos ao indice logico da sessao, evitando duplicados."""
     _ensure_session_rag_docs()
     added = 0
     for doc in docs:
@@ -529,7 +901,7 @@ def _build_faiss_index(embeddings):
     return index
 
 
-def _retrieve_attachment_chunks_embeddings(
+def _retrieve_attachment_chunks_hybrid(
     docs: list[dict],
     query: str,
     top_k: int,
@@ -538,15 +910,16 @@ def _retrieve_attachment_chunks_embeddings(
     reranker_model_name: str = RERANKER_MODEL_OPTIONS[0],
     candidate_multiplier: int = ATTACHMENT_CANDIDATE_MULTIPLIER,
 ) -> tuple[str, dict]:
-    """RAG real: chunks -> embeddings -> FAISS -> top-k -> reranker opcional."""
+    """RAG hibrido SOTA:
+
+      chunks -> (1) BM25 lexical + (2) embeddings densos + FAISS
+             -> fusao por Reciprocal Rank Fusion (RRF)
+             -> reranker neural opcional (cross-encoder)
+             -> top-k para o modelo
+    Degrada graciosamente: so denso ou so BM25 se faltar uma das vias.
+    """
     if not docs:
         return "", {"mode": "empty", "selected": [], "total_chunks": 0}
-    if not HAS_NUMPY:
-        raise RuntimeError("numpy nao esta instalado. Instala com: pip install numpy")
-    if not HAS_SENTENCE_TRANSFORMERS:
-        raise RuntimeError("sentence-transformers nao esta instalado. Instala com: pip install sentence-transformers")
-    if not HAS_FAISS:
-        raise RuntimeError("faiss-cpu nao esta instalado. Instala com: pip install faiss-cpu")
 
     candidates = []
     for doc_i, doc in enumerate(docs):
@@ -562,32 +935,69 @@ def _retrieve_attachment_chunks_embeddings(
                 "end": end,
                 "text": chunk,
             })
-
     if not candidates:
         return "", {"mode": "empty", "selected": [], "total_chunks": 0}
 
-    model = load_embedding_model(embedding_model_name)
-    chunk_texts = [c["text"] for c in candidates]
-    doc_emb = _embed_documents(model, chunk_texts)
-    query_emb = _embed_query(model, query)
-
-    index = _build_faiss_index(doc_emb)
     n_candidates = min(len(candidates), max(top_k, top_k * candidate_multiplier))
-    scores, idxs = index.search(query_emb.astype("float32"), n_candidates)
+    dense_ranks: dict[int, int] = {}
+    sparse_ranks: dict[int, int] = {}
+    dense_ok = HAS_NUMPY and HAS_FAISS and HAS_SENTENCE_TRANSFORMERS
+    sparse_ok = HAS_BM25
+
+    # Via densa: embeddings + FAISS
+    if dense_ok:
+        try:
+            model = load_embedding_model(embedding_model_name)
+            doc_emb = _embed_documents(model, [c["text"] for c in candidates])
+            query_emb = _embed_query(model, query)
+            index = _build_faiss_index(doc_emb)
+            scores, idxs = index.search(query_emb.astype("float32"), n_candidates)
+            for rank, (idx, score) in enumerate(zip(idxs[0].tolist(), scores[0].tolist()), 1):
+                if idx >= 0 and idx not in dense_ranks:
+                    dense_ranks[idx] = rank
+                    candidates[idx]["dense_score"] = float(score)
+        except Exception as e:
+            dense_ok = False
+            for c in candidates:
+                c["dense_error"] = str(e)[:120]
+
+    # Via lexical: BM25 sobre os mesmos chunks
+    if sparse_ok:
+        try:
+            tokenized = [_tokenize(c["text"]) for c in candidates]
+            bm25 = BM25Okapi(tokenized)
+            bm_scores = bm25.get_scores(_tokenize(query))
+            order = sorted(range(len(candidates)), key=lambda i: bm_scores[i], reverse=True)
+            for rank, idx in enumerate(order[:n_candidates], 1):
+                if bm_scores[idx] <= 0:
+                    break
+                sparse_ranks[idx] = rank
+                candidates[idx]["bm25_score"] = float(bm_scores[idx])
+        except Exception:
+            sparse_ok = False
+
+    if not dense_ok and not sparse_ok:
+        raise RuntimeError(
+            "RAG indisponivel: instala 'sentence-transformers'+'faiss-cpu'+'numpy' "
+            "(via densa) e/ou 'rank-bm25' (via lexical).")
+
+    # Fusao por Reciprocal Rank Fusion
+    fused: dict[int, float] = {}
+    for idx, rank in dense_ranks.items():
+        fused[idx] = fused.get(idx, 0.0) + 1.0 / (RRF_K + rank)
+    for idx, rank in sparse_ranks.items():
+        fused[idx] = fused.get(idx, 0.0) + 1.0 / (RRF_K + rank)
 
     ranked = []
-    seen = set()
-    for rank, (idx, score) in enumerate(zip(idxs[0].tolist(), scores[0].tolist()), 1):
-        if idx < 0 or idx in seen:
-            continue
-        seen.add(idx)
+    for idx, score in sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:n_candidates]:
         item = dict(candidates[idx])
-        item["semantic_rank"] = rank
-        item["semantic_score"] = float(score)
+        item["rrf_score"] = float(score)
+        item["dense_rank"] = dense_ranks.get(idx)
+        item["bm25_rank"] = sparse_ranks.get(idx)
         ranked.append(item)
 
-    # Reranking neural opcional: mais lento, mas normalmente melhora respostas em documentos longos.
-    if use_reranker and ranked:
+    # Reranking neural opcional (cross-encoder): mais lento, mas mais preciso.
+    if use_reranker and ranked and HAS_SENTENCE_TRANSFORMERS:
         try:
             reranker = load_reranker_model(reranker_model_name)
             pairs = [[query, r["text"]] for r in ranked]
@@ -597,35 +1007,42 @@ def _retrieve_attachment_chunks_embeddings(
             ranked = sorted(ranked, key=lambda r: r.get("rerank_score", 0.0), reverse=True)
         except Exception as e:
             for r in ranked:
-                r["rerank_error"] = str(e)
+                r["rerank_error"] = str(e)[:120]
 
     selected = ranked[:top_k]
 
+    via = []
+    if dense_ok:
+        via.append(f"densa ({embedding_model_name})")
+    if sparse_ok:
+        via.append("lexical (BM25)")
     parts = [
-        "[RAG COM EMBEDDINGS EM ANEXOS]",
-        "Os trechos abaixo foram recuperados por similaridade semantica a partir dos anexos da sessao.",
-        f"Modelo de embeddings: {embedding_model_name}",
-        f"Reranker neural: {'ativo (' + reranker_model_name + ')' if use_reranker else 'inativo'}",
+        "[RAG HIBRIDO EM ANEXOS]",
+        "Os trechos abaixo foram recuperados dos anexos da sessao por pesquisa hibrida: "
+        + " + ".join(via) + ", fundidos por Reciprocal Rank Fusion"
+        + (f", reordenados por reranker neural ({reranker_model_name})" if use_reranker else "")
+        + ".",
         "Usa estes trechos como evidencia. Se a resposta nao estiver nos trechos recuperados, diz isso explicitamente.",
         "Quando possivel, refere o ficheiro e o numero do trecho usado.",
         "[FIM NOTA RAG]",
     ]
-
     total = sum(len(d.get("text", "")) for d in docs)
-    header = (
-        f"Texto total indexado na sessao: {total:,} caracteres · "
-        f"chunks avaliados: {len(candidates)} · candidatos reordenados: {len(ranked)} · "
-        f"trechos enviados: {len(selected)}"
-    )
+    header = (f"Texto total indexado na sessao: {total:,} caracteres · "
+              f"chunks avaliados: {len(candidates)} · fundidos por RRF: {len(ranked)} · "
+              f"trechos enviados: {len(selected)}")
     parts.append(header.replace(",", " "))
 
     used_chars = 0
     for n, c in enumerate(selected, 1):
-        score_bits = [f"semantic_score: {c.get('semantic_score', 0):.4f}"]
+        score_bits = [f"rrf: {c.get('rrf_score', 0):.5f}"]
+        if c.get("dense_rank"):
+            score_bits.append("dense#%d (%.3f)" % (c["dense_rank"], c.get("dense_score", 0)))
+        if c.get("bm25_rank"):
+            score_bits.append("bm25#%d (%.2f)" % (c["bm25_rank"], c.get("bm25_score", 0)))
         if "rerank_score" in c:
-            score_bits.append(f"rerank_score: {c['rerank_score']:.4f}")
+            score_bits.append(f"rerank: {c['rerank_score']:.4f}")
         if "rerank_error" in c:
-            score_bits.append(f"reranker_error: {c['rerank_error'][:120]}")
+            score_bits.append(f"rerank_err: {c['rerank_error']}")
         block = (
             f"\n--- TRECHO RAG {n} | ficheiro: {c['file']} | "
             f"chunk: {c['chunk_i'] + 1} | chars: {c['start']}-{c['end']} | "
@@ -642,14 +1059,15 @@ def _retrieve_attachment_chunks_embeddings(
         used_chars += len(block)
 
     meta = {
-        "mode": "embedding_rag",
-        "embedding_model": embedding_model_name,
+        "mode": "hybrid_rag",
+        "dense": dense_ok, "sparse": sparse_ok,
+        "embedding_model": embedding_model_name if dense_ok else None,
         "reranker_model": reranker_model_name if use_reranker else None,
         "reranker_active": bool(use_reranker),
         "selected": [
             {k: c.get(k) for k in (
-                "file", "chunk_i", "start", "end", "semantic_rank", "semantic_score", "rerank_score", "rerank_error"
-            )}
+                "file", "chunk_i", "start", "end", "rrf_score", "dense_rank",
+                "bm25_rank", "rerank_score")}
             for c in selected
         ],
         "total_chunks": len(candidates),
@@ -666,13 +1084,14 @@ def extract_files(
     embedding_model_name: str = EMBEDDING_MODEL_OPTIONS[0],
     use_reranker: bool = False,
     reranker_model_name: str = RERANKER_MODEL_OPTIONS[0],
+    use_vlm: bool = True,
 ) -> tuple[str, list[str], list[str], dict]:
     """Devolve (texto_contexto, nomes, avisos, meta).
 
-    - Extrai texto de PDF/PPTX/imagem/TXT.
-    - Guarda os documentos numa base RAG persistente na sessao.
-    - Se o RAG estiver ativo, recupera semanticamente os trechos mais relevantes.
-    - Se o RAG estiver inativo, usa o modo antigo com limites/truncagem.
+    - Extrai texto de PDF/PPTX/TXT; imagens passam por VLM + OCR.
+    - Guarda os documentos numa base RAG persistente na sessao (e na conversa).
+    - Se o RAG estiver ativo, recupera os trechos mais relevantes (hibrido).
+    - Se o RAG estiver inativo, usa o modo direto com limites/truncagem.
     """
     docs, names, warnings = [], [], []
     for f in files:
@@ -687,9 +1106,6 @@ def extract_files(
         if ext in ("pptx", "ppt") and not HAS_PPTX:
             warnings.append(f"{name}: instala 'python-pptx' para ler PPTX.")
             continue
-        if ext in IMG_EXTS and not HAS_OCR:
-            warnings.append(f"{name}: OCR indisponivel (instala 'tesseract-ocr' + pillow).")
-            continue
 
         try:
             if ext == "pdf":
@@ -697,7 +1113,7 @@ def extract_files(
             elif ext in ("pptx", "ppt"):
                 txt = extract_pptx(data)
             elif ext in IMG_EXTS:
-                txt = extract_image(data)
+                txt = extract_image(data, ext, query=query, use_vlm=use_vlm)
             else:
                 txt = data.decode("utf-8", "ignore")
         except Exception as e:
@@ -715,12 +1131,12 @@ def extract_files(
 
     added = add_docs_to_session_rag(docs)
     if added:
-        warnings.append(f"{added} documento(s) adicionados ao índice RAG da sessão.")
+        warnings.append(f"{added} documento(s) adicionados ao indice RAG da conversa.")
 
     raw_total = sum(len(d["text"]) for d in docs)
 
     if use_attachment_search:
-        ctx, meta = _retrieve_attachment_chunks_embeddings(
+        ctx, meta = _retrieve_attachment_chunks_hybrid(
             st.session_state.rag_docs,
             query,
             max(1, attachment_top_k),
@@ -730,7 +1146,7 @@ def extract_files(
         )
         return ctx, names, warnings, meta
 
-    # Modo antigo: direto/truncado.
+    # Modo direto/truncado.
     chunks = []
     for doc in docs:
         txt = doc["text"]
@@ -751,11 +1167,11 @@ def retrieve_session_rag_context(
     use_reranker: bool = False,
     reranker_model_name: str = RERANKER_MODEL_OPTIONS[0],
 ) -> tuple[str, dict]:
-    """Recupera contexto da base RAG da sessão mesmo sem novos anexos."""
+    """Recupera contexto da base RAG da conversa mesmo sem novos anexos."""
     _ensure_session_rag_docs()
     if not st.session_state.rag_docs:
         return "", {"mode": "empty"}
-    return _retrieve_attachment_chunks_embeddings(
+    return _retrieve_attachment_chunks_hybrid(
         st.session_state.rag_docs,
         query,
         max(1, attachment_top_k),
@@ -792,7 +1208,6 @@ def new_thread_id() -> str:
 RATE_LIMIT_RETRIES = 4
 RATE_LIMIT_BASE_DELAY = 2.0
 # Chunk pequeno para o requests entregar eventos assim que chegam.
-# Se estiver None, alguns servidores/proxies acumulam e o texto so aparece no fim.
 STREAM_CHUNK_SIZE = 64
 _min_interval = [1.2]
 _throttle_lock = threading.Lock()
@@ -925,7 +1340,7 @@ def respond(model_key: str, message: str, thread_id: str, api_key: str, persist:
 
 
 # ---------------------------------------------------------------------------
-# Estimativas
+# Estimativas e contabilizacao de custos da sessao
 # ---------------------------------------------------------------------------
 def est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
@@ -937,8 +1352,15 @@ def est_cost(prompt: str, output: str, model_key: str) -> float:
             + est_tokens(output) / 1_000_000 * cfg["price_out"])
 
 
+def track_usage(model_key: str, prompt: str, output: str):
+    u = st.session_state.setdefault("usage", {"cost": 0.0, "calls": 0, "tokens_out": 0})
+    u["cost"] += est_cost(prompt, output, model_key)
+    u["calls"] += 1
+    u["tokens_out"] += est_tokens(output)
+
+
 # ---------------------------------------------------------------------------
-# Composicao da mensagem (memoria + transcricao da sessao + anexos + pergunta)
+# Composicao da mensagem (memoria + conversa + anexos + web + pergunta)
 # ---------------------------------------------------------------------------
 def _compact_for_context(text: str, cap: int = 6000) -> str:
     """Limita blocos muito longos sem rebentar o contexto."""
@@ -947,11 +1369,11 @@ def _compact_for_context(text: str, cap: int = 6000) -> str:
         return text
     head = cap // 2
     tail = cap - head
-    return text[:head] + "\n...[texto intermédio omitido]...\n" + text[-tail:]
+    return text[:head] + "\n...[texto intermedio omitido]...\n" + text[-tail:]
 
 
 def _assistant_msg_to_text(msg: dict) -> str:
-    """Converte os vários modos da UI para texto utilizável como contexto."""
+    """Converte os varios modos da UI para texto utilizavel como contexto."""
     mode = msg.get("mode")
     if mode == "single":
         model = MODELS.get(msg.get("model", ""), {}).get("label", msg.get("model", "assistant"))
@@ -981,11 +1403,7 @@ def _assistant_msg_to_text(msg: dict) -> str:
 
 
 def session_transcript(max_chars: int = SESSION_TRANSCRIPT_CAP) -> str:
-    """Transcricao da conversa atual, em janela deslizante.
-
-    Usa st.session_state.messages, que ja alimenta o render_history().
-    A janela e montada do fim para o inicio para preservar os turnos mais recentes.
-    """
+    """Transcricao da conversa atual, em janela deslizante (fim -> inicio)."""
     messages = st.session_state.get("messages", [])
     blocks = []
 
@@ -1018,6 +1436,7 @@ def build_agent_message(
     use_memory: bool,
     attach_text: str,
     use_session_context: bool = True,
+    web_text: str = "",
 ) -> str:
     parts = []
 
@@ -1038,79 +1457,107 @@ def build_agent_message(
             )
 
     if attach_text:
-        parts.append("[FICHEIROS ANEXADOS NESTE TURNO]\n" + attach_text + "\n[FIM FICHEIROS]")
+        parts.append("[FICHEIROS / ANEXOS DA CONVERSA]\n" + attach_text + "\n[FIM FICHEIROS]")
+
+    if web_text:
+        parts.append(web_text)
 
     parts.append("[PERGUNTA ATUAL]\n" + user_prompt)
     return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Tema / CSS / Hero
+# Tema / CSS — "blueprint industrial" (TIC: CAD, 3D printing, 3D reality)
 # ---------------------------------------------------------------------------
 THEME_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
 :root{
-  --bg:#0B0E14; --bg-2:#11151F; --bg-3:#161B26;
-  --line:#222A38; --line-2:#2E3850;
-  --text:#E7EBF3; --muted:#8B94A7; --faint:#5B6577;
-  --claude:#D2A24C; --gpt:#46B98C; --accent:#D2A24C;
-  --font-display:'Fraunces',Georgia,serif;
-  --font-ui:'IBM Plex Sans',system-ui,sans-serif;
+  --bg:#090D13; --bg-2:#0F141D; --bg-3:#141B27;
+  --line:#1F2937; --line-2:#2C3A52;
+  --text:#E8EDF5; --muted:#8B96AB; --faint:#5A6679;
+  --claude:#D2A24C; --gpt:#46B98C; --tic:#5CC8E8; --accent:#D2A24C;
+  --font-display:'Space Grotesk',system-ui,sans-serif;
+  --font-ui:'Inter',system-ui,sans-serif;
   --font-mono:'JetBrains Mono',ui-monospace,monospace;
 }
 .stApp,[data-testid="stAppViewContainer"]{
   background:
-    radial-gradient(1100px 560px at 82% -12%, rgba(210,162,76,0.07), transparent 60%),
-    radial-gradient(900px 520px at -8% 6%, rgba(70,185,140,0.055), transparent 55%),
+    /* grelha blueprint muito subtil */
+    repeating-linear-gradient(0deg, rgba(92,200,232,0.022) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(90deg, rgba(92,200,232,0.022) 0 1px, transparent 1px 56px),
+    radial-gradient(1100px 560px at 85% -12%, rgba(210,162,76,0.06), transparent 60%),
+    radial-gradient(900px 520px at -8% 4%, rgba(92,200,232,0.05), transparent 55%),
     var(--bg);
   color:var(--text); font-family:var(--font-ui);
 }
 [data-testid="stHeader"]{ background:transparent; }
 [data-testid="stMainBlockContainer"],.block-container{ max-width:1080px; padding-top:1.1rem; padding-bottom:5rem; }
 body,p,li,span,div{ font-family:var(--font-ui); }
-[data-testid="stSidebar"]{ background:linear-gradient(180deg,var(--bg-2),#0E121B); border-right:1px solid var(--line); }
-[data-testid="stSidebar"] .block-container{ padding-top:1.4rem; }
-.eyebrow{ font-family:var(--font-mono); text-transform:uppercase; letter-spacing:.22em; font-size:.64rem;
-  color:var(--faint); margin:1.1rem 0 .55rem; display:flex; align-items:center; gap:.6rem; }
-.eyebrow::after{ content:""; height:1px; flex:1; background:var(--line); }
+h1,h2,h3{ font-family:var(--font-display); letter-spacing:-.01em; }
+[data-testid="stSidebar"]{ background:linear-gradient(180deg,var(--bg-2),#0C111A); border-right:1px solid var(--line); }
+[data-testid="stSidebar"] .block-container{ padding-top:1.3rem; }
+
+/* eyebrows com marca de cota (dimension line) */
+.eyebrow{ font-family:var(--font-mono); text-transform:uppercase; letter-spacing:.22em; font-size:.62rem;
+  color:var(--faint); margin:1.15rem 0 .55rem; display:flex; align-items:center; gap:.6rem; }
+.eyebrow::before{ content:""; width:7px; height:7px; border:1px solid var(--line-2); transform:rotate(45deg); flex:none; }
+.eyebrow::after{ content:""; height:1px; flex:1;
+  background:linear-gradient(90deg,var(--line-2),transparent); }
+
 [data-testid="stChatMessage"]{ background:var(--bg-2); border:1px solid var(--line); border-radius:16px;
-  padding:1.05rem 1.25rem; box-shadow:0 1px 0 rgba(255,255,255,.02),0 14px 34px rgba(0,0,0,.30); }
+  padding:1.05rem 1.25rem; box-shadow:0 1px 0 rgba(255,255,255,.02),0 14px 34px rgba(0,0,0,.32);
+  position:relative; }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]){
-  background:transparent; border:1px dashed var(--line-2); box-shadow:none; }
+  background:linear-gradient(180deg, rgba(92,200,232,.035), transparent 70%);
+  border:1px dashed var(--line-2); box-shadow:none; }
 [data-testid^="stChatMessageAvatar"]{ display:none; }
 [data-testid="stChatMessage"] > div:first-child{ gap:0 !important; }
-[data-testid="stChatMessage"] p{ line-height:1.62; }
-[data-testid="stChatMessage"] code{ font-family:var(--font-mono); background:#0c1119; border:1px solid var(--line);
+[data-testid="stChatMessage"] p{ line-height:1.64; }
+[data-testid="stChatMessage"] code{ font-family:var(--font-mono); background:#0b1018; border:1px solid var(--line);
   padding:.05rem .35rem; border-radius:6px; font-size:.86em; }
-[data-testid="stChatMessage"] pre{ background:#0c1119 !important; border:1px solid var(--line); border-radius:12px; }
-a{ color:var(--accent); }
+[data-testid="stChatMessage"] pre{ background:#0b1018 !important; border:1px solid var(--line); border-radius:12px; }
+a{ color:var(--tic); }
+
 [data-testid="stChatInput"]{ background:var(--bg-2); border:1px solid var(--line); border-radius:14px; }
-[data-testid="stChatInput"]:focus-within{ border-color:var(--accent); box-shadow:0 0 0 3px rgba(210,162,76,.14); }
+[data-testid="stChatInput"]:focus-within{ border-color:var(--tic); box-shadow:0 0 0 3px rgba(92,200,232,.13); }
+
 .stButton > button{ background:transparent; color:var(--text); border:1px solid var(--line-2); border-radius:10px;
-  font-family:var(--font-mono); text-transform:uppercase; letter-spacing:.1em; font-size:.72rem;
-  padding:.5rem .9rem; transition:all .15s ease; }
-.stButton > button:hover{ border-color:var(--accent); color:var(--accent); background:rgba(210,162,76,.06); }
+  font-family:var(--font-mono); text-transform:uppercase; letter-spacing:.09em; font-size:.7rem;
+  padding:.5rem .85rem; transition:all .15s ease; }
+.stButton > button:hover{ border-color:var(--tic); color:var(--tic); background:rgba(92,200,232,.06); }
+.stDownloadButton > button{ background:transparent; color:var(--text); border:1px solid var(--line-2);
+  border-radius:10px; font-family:var(--font-mono); font-size:.7rem; letter-spacing:.09em;
+  text-transform:uppercase; }
+.stDownloadButton > button:hover{ border-color:var(--accent); color:var(--accent); }
+
 [data-testid="stExpander"]{ border:1px solid var(--line); border-radius:12px; background:var(--bg-2); }
 [data-testid="stExpander"] summary{ font-family:var(--font-mono); font-size:.78rem; letter-spacing:.04em; }
 [data-testid="stVerticalBlockBorderWrapper"]{ background:var(--bg-3); border-radius:14px; }
 [data-testid="stFileUploaderDropzone"]{ background:var(--bg-3); border:1px dashed var(--line-2); border-radius:12px; }
+[data-testid="stPopover"] button{ font-family:var(--font-mono); }
+
 .badge{ display:inline-flex; align-items:center; gap:.55rem; font-family:var(--font-mono); font-size:.72rem;
   padding:.32rem .7rem; border:1px solid var(--line-2); border-radius:999px; background:var(--bg-3); color:var(--text); }
 .badge .dot{ width:8px; height:8px; border-radius:50%; box-shadow:0 0 10px 0 currentColor; }
 .badge--claude{ border-color:rgba(210,162,76,.4); } .badge--claude .dot{ background:var(--claude); color:var(--claude); }
 .badge--gpt{ border-color:rgba(70,185,140,.4); } .badge--gpt .dot{ background:var(--gpt); color:var(--gpt); }
+.badge--tic{ border-color:rgba(92,200,232,.4); } .badge--tic .dot{ background:var(--tic); color:var(--tic); }
 .badge .sub{ color:var(--faint); margin-left:.35rem; }
+
 .reason{ margin:.55rem 0 .2rem; padding:.6rem .85rem; border-left:2px solid var(--line-2); background:var(--bg-3);
   border-radius:0 10px 10px 0; color:var(--muted); font-size:.85rem; line-height:1.5; }
 .reason b{ color:var(--text); font-weight:600; }
 .reason--claude{ border-left-color:var(--claude); } .reason--gpt{ border-left-color:var(--gpt); }
+
 .metricline{ font-family:var(--font-mono); font-size:.7rem; color:var(--muted); display:flex; gap:.55rem;
   flex-wrap:wrap; margin-top:.5rem; } .metricline .sep{ color:var(--faint); }
+
 .step{ font-family:var(--font-mono); text-transform:uppercase; letter-spacing:.14em; font-size:.7rem;
   color:var(--muted); margin:1.1rem 0 .35rem; display:flex; align-items:center; gap:.6rem; }
 .step .n{ width:1.35rem; height:1.35rem; border-radius:6px; background:var(--text); color:var(--bg);
   display:inline-flex; align-items:center; justify-content:center; font-weight:600; font-size:.72rem; }
+
 .col-head{ display:flex; align-items:center; justify-content:space-between; margin:.2rem 0 .5rem; }
 .routerule{ display:flex; gap:.55rem; align-items:flex-start; padding:.35rem 0; font-size:.8rem;
   color:var(--text); border-bottom:1px solid var(--line); }
@@ -1118,74 +1565,141 @@ a{ color:var(--accent); }
 .routerule .d{ width:8px; height:8px; border-radius:50%; margin-top:.42rem; flex:none; }
 .routerule .b{ display:block; font-family:var(--font-mono); font-size:.66rem; color:var(--faint); margin-top:.1rem; }
 .attach-note{ font-family:var(--font-mono); font-size:.68rem; color:var(--faint); margin-top:.4rem; }
+.src-note{ font-family:var(--font-mono); font-size:.68rem; color:var(--faint); margin-top:.45rem; line-height:1.7; }
+.src-note a{ color:var(--tic); text-decoration:none; border-bottom:1px dotted var(--line-2); }
+
 .userbox{ display:flex; align-items:center; gap:.6rem; padding:.55rem .7rem; border:1px solid var(--line);
   border-radius:12px; background:var(--bg-3); margin-bottom:.4rem; }
-.userbox .av{ width:30px; height:30px; border-radius:8px; background:linear-gradient(135deg,var(--claude),var(--gpt));
-  display:flex; align-items:center; justify-content:center; font-family:var(--font-mono); font-weight:600; color:#0B0E14; }
+.userbox .av{ width:30px; height:30px; border-radius:8px; background:linear-gradient(135deg,var(--tic),var(--claude));
+  display:flex; align-items:center; justify-content:center; font-family:var(--font-mono); font-weight:600; color:#0A0E14; }
 .userbox .n{ font-size:.85rem; } .userbox .r{ font-family:var(--font-mono); font-size:.62rem; color:var(--faint); }
+
+.convtitle{ font-family:var(--font-mono); font-size:.68rem; color:var(--faint); letter-spacing:.06em; }
+.usagebox{ font-family:var(--font-mono); font-size:.68rem; color:var(--muted); border:1px solid var(--line);
+  border-radius:10px; padding:.5rem .7rem; background:var(--bg-3); display:flex; gap:.8rem; }
+.usagebox b{ color:var(--tic); font-weight:600; }
+
 .authwrap{ max-width:420px; margin:.5rem auto 0; }
 .authwrap h3{ font-family:var(--font-display); font-weight:600; font-size:1.4rem; margin-bottom:.2rem; }
 .authwrap p.s{ color:var(--muted); font-size:.85rem; margin-bottom:.4rem; }
 </style>
 """
 
+# ---------------------------------------------------------------------------
+# Hero — peca 3D wireframe a rodar sobre grelha blueprint
+# ---------------------------------------------------------------------------
 HERO_HTML = """
 <!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap');
 *{margin:0;padding:0;box-sizing:border-box;}
-html,body{height:100%;overflow:hidden;background:#0B0E14;}
+html,body{height:100%;overflow:hidden;background:#090D13;}
 #c{position:absolute;inset:0;}
 .wrap{position:relative;height:100%;display:flex;flex-direction:column;justify-content:center;
-  padding:26px 30px;font-family:'IBM Plex Sans',sans-serif;color:#E7EBF3;}
-.eye{font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.34em;
-  font-size:11px;color:#5B6577;margin-bottom:12px;}
-h1{font-family:'Fraunces',serif;font-weight:600;font-size:46px;line-height:1;letter-spacing:-.5px;}
-h1 .x{color:#D2A24C;font-style:italic;margin:0 10px;font-weight:500;}
-.sub{margin-top:14px;font-family:'JetBrains Mono',monospace;font-size:13px;color:#8B94A7;height:18px;}
-.sub .cur{color:#D2A24C;}
-.pills{position:absolute;top:26px;right:30px;display:flex;gap:8px;}
-.pill{font-family:'JetBrains Mono',monospace;font-size:11px;color:#E7EBF3;border:1px solid #2E3850;
-  border-radius:999px;padding:5px 11px;display:flex;align-items:center;gap:7px;background:rgba(22,27,38,.6);}
+  padding:26px 32px;font-family:'Inter',sans-serif;color:#E8EDF5;}
+.eye{font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.32em;
+  font-size:10.5px;color:#5A6679;margin-bottom:12px;display:flex;align-items:center;gap:10px;}
+.eye .sq{width:7px;height:7px;border:1px solid #2C3A52;transform:rotate(45deg);}
+h1{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:46px;line-height:1;letter-spacing:-1px;}
+h1 .tic{color:#5CC8E8;}
+h1 .x{color:#D2A24C;margin:0 8px;font-weight:500;}
+.sub{margin-top:14px;font-family:'JetBrains Mono',monospace;font-size:13px;color:#8B96AB;height:18px;}
+.sub .cur{color:#5CC8E8;}
+.pills{position:absolute;top:24px;right:30px;display:flex;gap:8px;}
+.pill{font-family:'JetBrains Mono',monospace;font-size:11px;color:#E8EDF5;border:1px solid #2C3A52;
+  border-radius:999px;padding:5px 11px;display:flex;align-items:center;gap:7px;background:rgba(20,27,39,.65);}
 .pill .d{width:7px;height:7px;border-radius:50%;}
+.corner{position:absolute;width:16px;height:16px;border:1px solid #2C3A52;opacity:.8;}
+.corner.tl{top:12px;left:12px;border-right:none;border-bottom:none;}
+.corner.br{bottom:12px;right:12px;border-left:none;border-top:none;}
 .line{position:absolute;left:0;right:0;bottom:0;height:1px;
-  background:linear-gradient(90deg,transparent,#D2A24C55,#46B98C55,transparent);}
+  background:linear-gradient(90deg,transparent,#5CC8E855,#D2A24C55,#46B98C55,transparent);}
 </style></head><body>
 <canvas id="c"></canvas>
+<div class="corner tl"></div><div class="corner br"></div>
 <div class="pills">
   <div class="pill"><span class="d" style="background:#D2A24C;box-shadow:0 0 8px #D2A24C"></span>Opus 4.7</div>
   <div class="pill"><span class="d" style="background:#46B98C;box-shadow:0 0 8px #46B98C"></span>GPT-5.5</div>
 </div>
 <div class="wrap">
-  <div class="eye">IAedu &middot; Multi-Model Router</div>
-  <h1>Claude<span class="x">&times;</span>GPT</h1>
+  <div class="eye"><span class="sq"></span>Autoeuropa &middot; Technical Innovation Center</div>
+  <h1><span class="tic">TIC</span> Copilot <span class="x">&middot;</span> Claude <span class="x">&times;</span> GPT</h1>
   <div class="sub"><span id="t"></span><span class="cur">_</span></div>
 </div>
 <div class="line"></div>
 <script>
-var canvas=document.getElementById('c'),ctx=canvas.getContext('2d'),W,H,pts=[];
-function size(){W=canvas.width=canvas.offsetWidth;H=canvas.height=canvas.offsetHeight;
-  pts=[];var n=Math.floor(W/55);for(var i=0;i<n;i++){pts.push({x:Math.random()*W,y:Math.random()*H,
-  vx:(Math.random()-.5)*.25,vy:(Math.random()-.5)*.25});}}
+var canvas=document.getElementById('c'),ctx=canvas.getContext('2d'),W,H;
+function size(){W=canvas.width=canvas.offsetWidth;H=canvas.height=canvas.offsetHeight;}
 size();window.addEventListener('resize',size);
-function draw(){ctx.clearRect(0,0,W,H);
-  for(var i=0;i<pts.length;i++){var p=pts[i];p.x+=p.vx;p.y+=p.vy;
-    if(p.x<0||p.x>W)p.vx*=-1;if(p.y<0||p.y>H)p.vy*=-1;}
-  for(var i=0;i<pts.length;i++){for(var j=i+1;j<pts.length;j++){
-    var a=pts[i],b=pts[j],dx=a.x-b.x,dy=a.y-b.y,d=Math.sqrt(dx*dx+dy*dy);
-    if(d<130){ctx.strokeStyle='rgba(139,148,167,'+(.12*(1-d/130))+')';ctx.lineWidth=1;
-      ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();}}}
-  for(var i=0;i<pts.length;i++){ctx.fillStyle='rgba(210,162,76,.5)';
-    ctx.beginPath();ctx.arc(pts[i].x,pts[i].y,1.3,0,6.3);ctx.fill();}
-  requestAnimationFrame(draw);}
+
+// Perfil de engrenagem (12 dentes) extrudido — wireframe CAD
+var TEETH=12, prof=[];
+for(var i=0;i<TEETH*4;i++){
+  var a=i/(TEETH*4)*Math.PI*2;
+  var step=i%4, r=(step===0||step===3)?0.72:1.0;
+  prof.push([Math.cos(a)*r, Math.sin(a)*r]);
+}
+var bore=[]; for(var i=0;i<24;i++){var a=i/24*Math.PI*2; bore.push([Math.cos(a)*0.32, Math.sin(a)*0.32]);}
+function proj(p, rx, ry, s, cx, cy){
+  var x=p[0], y=p[1], z=p[2];
+  var c1=Math.cos(ry), s1=Math.sin(ry);     // rot Y
+  var x1=x*c1+z*s1, z1=-x*s1+z*c1;
+  var c2=Math.cos(rx), s2=Math.sin(rx);     // rot X
+  var y2=y*c2-z1*s2, z2=y*s2+z1*c2;
+  var d=3.2/(3.2+z2);
+  return [cx+x1*s*d, cy+y2*s*d];
+}
+function ring(pts, z){ return pts.map(function(p){return [p[0],p[1],z];}); }
+function drawLoop(pts3, rx, ry, s, cx, cy, color){
+  ctx.strokeStyle=color; ctx.lineWidth=1; ctx.beginPath();
+  for(var i=0;i<=pts3.length;i++){
+    var q=proj(pts3[i%pts3.length], rx, ry, s, cx, cy);
+    if(i===0)ctx.moveTo(q[0],q[1]); else ctx.lineTo(q[0],q[1]);
+  }
+  ctx.stroke();
+}
+var t0=Date.now();
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  var t=(Date.now()-t0)/1000;
+  var rx=0.42+Math.sin(t*0.21)*0.10, ry=t*0.35;
+  var cx=W*0.80, cy=H*0.52, s=Math.min(H*0.62, 120), dz=0.22;
+  var front=ring(prof,dz), back=ring(prof,-dz);
+  // arestas laterais
+  ctx.strokeStyle='rgba(92,200,232,0.20)'; ctx.lineWidth=1; ctx.beginPath();
+  for(var i=0;i<prof.length;i+=2){
+    var a=proj(front[i],rx,ry,s,cx,cy), b=proj(back[i],rx,ry,s,cx,cy);
+    ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]);
+  }
+  ctx.stroke();
+  drawLoop(front,rx,ry,s,cx,cy,'rgba(92,200,232,0.55)');
+  drawLoop(back,rx,ry,s,cx,cy,'rgba(92,200,232,0.28)');
+  drawLoop(ring(bore,dz),rx,ry,s,cx,cy,'rgba(210,162,76,0.55)');
+  drawLoop(ring(bore,-dz),rx,ry,s,cx,cy,'rgba(210,162,76,0.30)');
+  // nos dos dentes (frente)
+  for(var i=0;i<prof.length;i+=4){
+    var q=proj(front[i],rx,ry,s,cx,cy);
+    ctx.fillStyle='rgba(70,185,140,0.75)';
+    ctx.beginPath(); ctx.arc(q[0],q[1],1.6,0,6.3); ctx.fill();
+  }
+  // cruz de centro (estilo desenho tecnico)
+  var c=proj([0,0,0],rx,ry,s,cx,cy);
+  ctx.strokeStyle='rgba(139,150,171,0.35)';
+  ctx.beginPath();
+  ctx.moveTo(c[0]-10,c[1]); ctx.lineTo(c[0]+10,c[1]);
+  ctx.moveTo(c[0],c[1]-10); ctx.lineTo(c[0],c[1]+10);
+  ctx.stroke();
+  requestAnimationFrame(draw);
+}
 draw();
-var phrases=["Roteamento inteligente por tarefa","Memoria do utilizador entre sessoes",
-  "Upload de PDF, PPTX e imagem com OCR","Duelo e colaboracao entre modelos"];
+var phrases=["Gestao de pedidos CAD & impressao 3D","Roteamento inteligente por tarefa",
+  "RAG hibrido sobre os teus documentos","Pesquisa web, voz e visao por computador",
+  "Historico de conversas sempre disponivel"];
 var pi=0,ci=0,del=false,el=document.getElementById('t');
 function type(){var w=phrases[pi];el.textContent=w.substring(0,ci);
   if(!del){ci++;if(ci>w.length){del=true;setTimeout(type,1600);return;}}
   else{ci--;if(ci<0){del=false;pi=(pi+1)%phrases.length;ci=0;}}
-  setTimeout(type,del?28:55);}
+  setTimeout(type,del?26:52);}
 type();
 </script></body></html>
 """
@@ -1198,6 +1712,10 @@ def model_badge(k: str, sub: str | None = None) -> str:
     m = MODELS[k]
     sub_html = f"<span class='sub'>{sub}</span>" if sub else ""
     return f"<span class='badge badge--{k}'><span class='dot'></span>{m['label']}{sub_html}</span>"
+
+
+def tic_badge(text: str) -> str:
+    return f"<span class='badge badge--tic'><span class='dot'></span>{text}</span>"
 
 
 def reason_card(k: str, text: str) -> str:
@@ -1218,6 +1736,13 @@ def attach_note(names: list[str]) -> str:
     return f"<div class='attach-note'>anexos: {', '.join(names)}</div>"
 
 
+def sources_note(sources: list[dict]) -> str:
+    links = " · ".join(
+        f"<a href='{s['url']}' target='_blank'>[{s['n']}] {s['title'][:48]}</a>"
+        for s in sources if s.get("url"))
+    return f"<div class='src-note'>fontes web: {links}</div>"
+
+
 # ---------------------------------------------------------------------------
 # Render de historico
 # ---------------------------------------------------------------------------
@@ -1228,6 +1753,8 @@ def render_history():
                 st.markdown(msg["content"])
                 if msg.get("attachments"):
                     st.markdown(attach_note(msg["attachments"]), unsafe_allow_html=True)
+                if msg.get("web_sources"):
+                    st.markdown(sources_note(msg["web_sources"]), unsafe_allow_html=True)
             continue
         with st.chat_message("assistant"):
             mode = msg.get("mode")
@@ -1276,6 +1803,7 @@ def handle_single(send_text, display_text, forced_model, show_reason):
         full = st.write_stream(respond(model_key, send_text,
                                        st.session_state.threads[model_key],
                                        api_key_for(model_key), persist=True))
+    track_usage(model_key, send_text, full or "")
     st.session_state.messages.append({"role": "assistant", "mode": "single", "model": model_key,
                                       "reason": reason if show_reason else "", "content": full})
 
@@ -1333,6 +1861,7 @@ def handle_duel(send_text, display_text):
             ph[k].markdown(results[k])
             meta[k] = metric_html(k, results[k], times[k], send_text)
             metaph[k].markdown(meta[k], unsafe_allow_html=True)
+            track_usage(k, send_text, results[k])
     st.session_state.messages.append({"role": "assistant", "mode": "duel", "data": results, "meta": meta})
 
 
@@ -1365,6 +1894,8 @@ def handle_collab(send_text, display_text, do_synthesis):
             )
             st.markdown(step_html(3, f"Versao final - {MODELS[executor]['label']}"), unsafe_allow_html=True)
             synthesis = st.write_stream(respond(executor, synth_prompt, new_thread_id(), ex_key))
+    track_usage(executor, send_text, (draft or "") + (synthesis or ""))
+    track_usage(reviewer, critique_prompt, critique or "")
     st.session_state.messages.append({"role": "assistant", "mode": "collab", "executor": executor,
                                       "reviewer": reviewer, "draft": draft, "critique": critique,
                                       "synthesis": synthesis})
@@ -1377,6 +1908,11 @@ def reset_session():
     st.session_state.messages = []
     st.session_state.threads = {k: new_thread_id() for k in MODELS}
     st.session_state.uploader_key = st.session_state.get("uploader_key", 0) + 1
+    st.session_state.audio_key = st.session_state.get("audio_key", 0) + 1
+    st.session_state.conv_id = None
+    st.session_state.conv_title = None
+    st.session_state.conv_created = None
+    st.session_state.pop("voice_draft", None)
     clear_session_rag()
 
 
@@ -1442,7 +1978,7 @@ def render_auth():
 
 
 # ---------------------------------------------------------------------------
-# UI principal
+# Sidebar
 # ---------------------------------------------------------------------------
 def sidebar(username):
     with st.sidebar:
@@ -1452,10 +1988,41 @@ def sidebar(username):
                     f"<div><div class='n'>{u['name']}</div><div class='r'>@{u['user']}</div></div></div>",
                     unsafe_allow_html=True)
         if st.button("Terminar sessao", use_container_width=True):
+            save_current_conversation(username)
             st.session_state.auth = None
             reset_session()
             st.rerun()
 
+        # ---------------- Conversas (historico persistente) ----------------
+        st.markdown("<div class='eyebrow'>Conversas</div>", unsafe_allow_html=True)
+        if st.button("+ Nova conversa", use_container_width=True):
+            save_current_conversation(username)
+            reset_session()
+            st.rerun()
+        convs = list_conversations(username)
+        active_id = st.session_state.get("conv_id")
+        if not convs:
+            st.caption("Sem conversas guardadas. A primeira fica gravada automaticamente.")
+        for c in convs[:MAX_CONVERSATIONS_LISTED]:
+            cols = st.columns([0.84, 0.16])
+            mark = "» " if c["id"] == active_id else ""
+            title = c["title"] if len(c["title"]) <= 34 else c["title"][:34] + "..."
+            if cols[0].button(f"{mark}{title}", key=f"conv_{c['id']}", use_container_width=True,
+                              help=f"{c['n']} mensagens · {c['updated'][:16]}"):
+                save_current_conversation(username)
+                if load_conversation(username, c["id"]):
+                    st.rerun()
+            if cols[1].button("✕", key=f"del_{c['id']}", help="Apagar conversa"):
+                delete_conversation(username, c["id"])
+                if c["id"] == active_id:
+                    reset_session()
+                st.rerun()
+        if st.session_state.get("messages"):
+            st.download_button("Exportar conversa (.md)", conversation_markdown(),
+                               file_name=f"conversa_{st.session_state.get('conv_id') or 'atual'}.md",
+                               mime="text/markdown", use_container_width=True)
+
+        # ---------------- Modo ----------------
         st.markdown("<div class='eyebrow'>Modo de operacao</div>", unsafe_allow_html=True)
         mode = st.radio("Modo", ["Auto (Roteador)", "So Claude", "So GPT",
                                  "Duelo (lado a lado)", "Colaboracao"],
@@ -1463,26 +2030,45 @@ def sidebar(username):
         show_reason = st.toggle("Mostrar justificacao do roteamento", value=True)
         do_synthesis = st.toggle("Sintese final (colaboracao)", value=True) if mode == "Colaboracao" else False
 
+        # ---------------- Pesquisa web ----------------
+        st.markdown("<div class='eyebrow'>Pesquisa web</div>", unsafe_allow_html=True)
+        if HAS_DDG:
+            web_mode = st.radio("Web", ["Auto (roteador)", "Sempre", "Nunca"],
+                                index=0, label_visibility="collapsed", horizontal=True)
+        else:
+            web_mode = "Nunca"
+            st.caption("Pesquisa web off: instala `ddgs` (pip install ddgs).")
+
+        # ---------------- Anexos ----------------
         st.markdown("<div class='eyebrow'>Anexos (PDF, PPTX, imagem)</div>", unsafe_allow_html=True)
-        files = st.file_uploader("Anexar", type=["pdf", "pptx", "ppt", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
+        files = st.file_uploader("Anexar", type=["pdf", "pptx", "ppt", "png", "jpg", "jpeg", "webp", "bmp", "tiff", "txt", "md", "csv"],
                                  accept_multiple_files=True, label_visibility="collapsed",
                                  key=f"uploader_{st.session_state.uploader_key}")
         if files:
             st.caption(f"{len(files)} ficheiro(s) sera(o) anexado(s) ao proximo pedido.")
+        use_vlm = st.toggle("Interpretar imagens com VLM",
+                            value=bool(hf_token()),
+                            help=f"Modelo gratuito ({HF_VLM_MODEL}) via Hugging Face. Requer HF_TOKEN.")
+        if use_vlm and not hf_token():
+            st.caption("Define `HF_TOKEN` (gratuito em huggingface.co/settings/tokens) para ativar o VLM.")
         if not HAS_OCR:
-            st.caption("OCR off: instala 'tesseract-ocr' p/ ler imagens e PDFs digitalizados.")
+            st.caption("OCR off: instala 'tesseract-ocr' p/ ler texto em imagens e PDFs digitalizados.")
 
-        st.markdown("<div class='eyebrow'>RAG dos anexos</div>", unsafe_allow_html=True)
-        use_attachment_search = st.toggle("Usar RAG com embeddings", value=True)
+        # ---------------- RAG ----------------
+        st.markdown("<div class='eyebrow'>RAG hibrido dos anexos</div>", unsafe_allow_html=True)
+        use_attachment_search = st.toggle("Usar RAG hibrido (BM25 + embeddings + RRF)", value=True)
         attachment_top_k = st.slider("Trechos RAG a enviar", 2, 16, ATTACHMENT_TOP_K_DEFAULT, 1)
         embedding_model_name = st.selectbox("Modelo de embeddings", EMBEDDING_MODEL_OPTIONS, index=0)
-        use_reranker = st.toggle("Reranker neural", value=False, help="Mais preciso em documentos longos, mas mais lento e pesado.")
-        reranker_model_name = st.selectbox("Modelo reranker", RERANKER_MODEL_OPTIONS, index=0, disabled=not use_reranker)
+        use_reranker = st.toggle("Reranker neural", value=False,
+                                 help="Cross-encoder: mais preciso em documentos longos, mas mais lento.")
+        reranker_model_name = st.selectbox("Modelo reranker", RERANKER_MODEL_OPTIONS, index=0,
+                                           disabled=not use_reranker)
         _ensure_session_rag_docs()
         if st.session_state.rag_docs:
             total_chars = sum(len(d.get("text", "")) for d in st.session_state.rag_docs)
-            st.caption(f"Índice da sessão: {len(st.session_state.rag_docs)} doc(s), {total_chars:,} caracteres".replace(",", " "))
-            if st.button("Limpar índice RAG", use_container_width=True):
+            st.caption(f"Indice da conversa: {len(st.session_state.rag_docs)} doc(s), "
+                       f"{total_chars:,} caracteres".replace(",", " "))
+            if st.button("Limpar indice RAG", use_container_width=True):
                 clear_session_rag()
                 st.rerun()
         missing = []
@@ -1492,9 +2078,21 @@ def sidebar(username):
             missing.append("faiss-cpu")
         if not HAS_NUMPY:
             missing.append("numpy")
+        if not HAS_BM25:
+            missing.append("rank-bm25")
         if missing:
-            st.caption("RAG embeddings indisponível: instala " + ", ".join(missing))
+            st.caption("RAG parcial/indisponivel sem: " + ", ".join(missing))
 
+        # ---------------- Voz ----------------
+        st.markdown("<div class='eyebrow'>Voz</div>", unsafe_allow_html=True)
+        if HAS_WHISPER:
+            whisper_size = st.selectbox("Modelo de transcricao (Whisper)", WHISPER_SIZES,
+                                        index=WHISPER_SIZES.index(WHISPER_DEFAULT))
+        else:
+            whisper_size = WHISPER_DEFAULT
+            st.caption("Voz off: instala `faster-whisper` (pip install faster-whisper).")
+
+        # ---------------- Memoria ----------------
         st.markdown("<div class='eyebrow'>Memoria</div>", unsafe_allow_html=True)
         use_memory = st.toggle("Usar memoria master no contexto", value=True)
         use_session_context = st.toggle("Usar conversa atual como contexto", value=True)
@@ -1519,10 +2117,12 @@ def sidebar(username):
                 save_memory(username, {"master": "", "updated_at": None, "turns_since": 0})
                 st.rerun()
 
+        # ---------------- Sessao / custos ----------------
         st.markdown("<div class='eyebrow'>Sessao</div>", unsafe_allow_html=True)
-        if st.button("Nova conversa", use_container_width=True):
-            reset_session()
-            st.rerun()
+        usage = st.session_state.get("usage", {"cost": 0.0, "calls": 0, "tokens_out": 0})
+        st.markdown(f"<div class='usagebox'><span>custo <b>~${usage['cost']:.4f}</b></span>"
+                    f"<span>{usage['calls']} resp.</span>"
+                    f"<span>~{usage['tokens_out']} tok out</span></div>", unsafe_allow_html=True)
 
         st.markdown("<div class='eyebrow'>Avancado</div>", unsafe_allow_html=True)
         _min_interval[0] = st.slider("Intervalo minimo entre pedidos (s)", 0.0, 5.0, _min_interval[0], 0.1)
@@ -1539,13 +2139,68 @@ def sidebar(username):
             st.markdown(rows, unsafe_allow_html=True)
 
     return (mode, show_reason, do_synthesis, files, use_memory, use_session_context, auto_mem,
-            use_attachment_search, attachment_top_k, embedding_model_name, use_reranker, reranker_model_name)
+            use_attachment_search, attachment_top_k, embedding_model_name, use_reranker,
+            reranker_model_name, web_mode, use_vlm, whisper_size)
 
 
+# ---------------------------------------------------------------------------
+# Barra de entrada: acoes rapidas + voz
+# ---------------------------------------------------------------------------
+def render_quick_actions():
+    """Acoes rapidas TIC — so quando a conversa esta vazia."""
+    if st.session_state.get("messages"):
+        return
+    st.markdown("<div class='eyebrow'>Comecar com uma acao do TIC</div>", unsafe_allow_html=True)
+    cols = st.columns(2)
+    for i, (label, prompt) in enumerate(QUICK_ACTIONS):
+        if cols[i % 2].button(label, key=f"qa_{i}", use_container_width=True):
+            st.session_state.pending_prompt = prompt
+            st.rerun()
+
+
+def render_voice_input(whisper_size: str):
+    """Gravacao no browser + transcricao local com faster-whisper."""
+    with st.popover("🎙️ Entrada por voz", use_container_width=False):
+        if not HAS_WHISPER:
+            st.caption("Instala `faster-whisper` para transcrever audio localmente (gratis).")
+            return
+        audio = st.audio_input("Grava o teu pedido",
+                               key=f"audio_{st.session_state.get('audio_key', 0)}")
+        if audio is not None:
+            sig = hashlib.sha1(audio.getvalue()).hexdigest()
+            if st.session_state.get("voice_sig") != sig:
+                with st.spinner("A transcrever (Whisper local)..."):
+                    try:
+                        st.session_state.voice_draft = transcribe_audio(audio.getvalue(), whisper_size)
+                        st.session_state.voice_sig = sig
+                    except Exception as e:
+                        st.error(f"Falha na transcricao: {e}")
+        draft = st.session_state.get("voice_draft", "")
+        if draft:
+            edited = st.text_area("Transcricao (edita se precisares)", value=draft, height=110)
+            c1, c2 = st.columns(2)
+            if c1.button("Enviar pedido", use_container_width=True, type="primary"):
+                st.session_state.pending_prompt = edited.strip()
+                st.session_state.pop("voice_draft", None)
+                st.session_state.pop("voice_sig", None)
+                st.session_state.audio_key = st.session_state.get("audio_key", 0) + 1
+                st.rerun()
+            if c2.button("Descartar", use_container_width=True):
+                st.session_state.pop("voice_draft", None)
+                st.session_state.pop("voice_sig", None)
+                st.session_state.audio_key = st.session_state.get("audio_key", 0) + 1
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# UI principal
+# ---------------------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="Claude x GPT - Roteador", page_icon="*", layout="wide")
+    st.set_page_config(page_title="TIC Copilot — Claude x GPT", page_icon="◆", layout="wide")
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
+    if "audio_key" not in st.session_state:
+        st.session_state.audio_key = 0
     if "auth" not in st.session_state:
         st.session_state.auth = None
     st.markdown(THEME_CSS, unsafe_allow_html=True)
@@ -1560,18 +2215,24 @@ def main():
         reset_session()
 
     (mode, show_reason, do_synthesis, files, use_memory, use_session_context, auto_mem,
-     use_attachment_search, attachment_top_k, embedding_model_name, use_reranker, reranker_model_name) = sidebar(username)
+     use_attachment_search, attachment_top_k, embedding_model_name, use_reranker,
+     reranker_model_name, web_mode, use_vlm, whisper_size) = sidebar(username)
 
     render_history()
+    render_quick_actions()
+    render_voice_input(whisper_size)
 
-    prompt = st.chat_input("Escreve o teu pedido...")
+    prompt = st.chat_input("Escreve o teu pedido... (ou usa a entrada por voz)")
+    pending = st.session_state.pop("pending_prompt", None)
+    if not prompt and pending:
+        prompt = pending
     if not prompt:
         return
 
-    # Anexos
+    # ---------------- Anexos (extracao + RAG hibrido) ----------------
     attach_text, attach_names, attach_meta = "", [], {"mode": "empty"}
     if files:
-        with st.spinner("A extrair texto dos ficheiros..."):
+        with st.spinner("A processar anexos (extracao / OCR / VLM)..."):
             attach_text, attach_names, warns, attach_meta = extract_files(
                 files,
                 query=prompt,
@@ -1580,16 +2241,21 @@ def main():
                 embedding_model_name=embedding_model_name,
                 use_reranker=use_reranker,
                 reranker_model_name=reranker_model_name,
+                use_vlm=use_vlm,
             )
         for w in warns:
             st.warning(w)
-        if attach_meta.get("mode") in ("embedding_rag", "retrieval"):
-            st.info(
-                f"RAG dos anexos: {attach_meta.get('total_chunks', 0)} chunks avaliados; "
-                f"{len(attach_meta.get('selected', []))} enviados ao modelo."
-            )
+        if attach_meta.get("mode") == "hybrid_rag":
+            vias = []
+            if attach_meta.get("dense"):
+                vias.append("densa")
+            if attach_meta.get("sparse"):
+                vias.append("BM25")
+            st.info(f"RAG hibrido ({' + '.join(vias)} + RRF): "
+                    f"{attach_meta.get('total_chunks', 0)} chunks avaliados; "
+                    f"{len(attach_meta.get('selected', []))} enviados ao modelo.")
     elif use_attachment_search and st.session_state.get("rag_docs"):
-        with st.spinner("A recuperar trechos relevantes do índice RAG da sessão..."):
+        with st.spinner("A recuperar trechos relevantes do indice RAG da conversa..."):
             try:
                 attach_text, attach_meta = retrieve_session_rag_context(
                     prompt,
@@ -1599,23 +2265,34 @@ def main():
                     reranker_model_name=reranker_model_name,
                 )
                 attach_names = [d.get("name", "documento") for d in st.session_state.rag_docs]
-                if attach_meta.get("mode") == "embedding_rag":
-                    st.info(
-                        f"RAG dos anexos: {attach_meta.get('total_chunks', 0)} chunks avaliados; "
-                        f"{len(attach_meta.get('selected', []))} enviados ao modelo."
-                    )
             except Exception as e:
-                st.warning(f"Falha no RAG de sessão: {e}")
+                st.warning(f"Falha no RAG da conversa: {e}")
                 attach_text, attach_meta = "", {"mode": "error", "error": str(e)}
 
-    display_text = prompt
-    send_text = build_agent_message(prompt, username, use_memory, attach_text, use_session_context)
+    # ---------------- Pesquisa web ----------------
+    web_text, web_sources = "", []
+    decision_preview = route(prompt, total_len=len(prompt))
+    should_search = (web_mode == "Sempre"
+                     or (web_mode == "Auto (roteador)" and decision_preview.get("rule_id") == "web"))
+    if should_search and HAS_DDG:
+        with st.spinner("A pesquisar na web (DuckDuckGo)..."):
+            web_text, web_sources = web_search_context(prompt)
+        if not web_text:
+            st.warning("Pesquisa web sem resultados utilizaveis - a responder so com o modelo.")
 
-    st.session_state.messages.append({"role": "user", "content": prompt, "attachments": attach_names})
+    display_text = prompt
+    send_text = build_agent_message(prompt, username, use_memory, attach_text,
+                                    use_session_context, web_text=web_text)
+
+    st.session_state.messages.append({"role": "user", "content": prompt,
+                                      "attachments": attach_names,
+                                      "web_sources": web_sources})
     with st.chat_message("user"):
         st.markdown(prompt)
         if attach_names:
             st.markdown(attach_note(attach_names), unsafe_allow_html=True)
+        if web_sources:
+            st.markdown(sources_note(web_sources), unsafe_allow_html=True)
 
     if mode == "Auto (Roteador)":
         handle_single(send_text, display_text, None, show_reason)
@@ -1628,6 +2305,9 @@ def main():
     elif mode == "Colaboracao":
         handle_collab(send_text, display_text, do_synthesis)
 
+    # Historico persistente: grava a conversa apos cada turno
+    save_current_conversation(username)
+
     # Memoria: log + atualizacao automatica
     append_log(username, display_text, mode)
     mem = load_memory(username)
@@ -1638,7 +2318,7 @@ def main():
             summarize_memory(username)
 
     # Limpa o uploader para o proximo turno
-    if attach_names:
+    if attach_names and files:
         st.session_state.uploader_key += 1
         st.rerun()
 
