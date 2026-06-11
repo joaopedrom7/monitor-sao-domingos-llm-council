@@ -1360,6 +1360,28 @@ def track_usage(model_key: str, prompt: str, output: str):
 
 
 # ---------------------------------------------------------------------------
+# Streaming suave: efeito maquina-de-escrever consistente
+# ---------------------------------------------------------------------------
+def smooth_stream(gen, chunk_chars: int = 3, delay: float = 0.010):
+    """Reparte blocos grandes em micro-pedacos com um pequeno atraso.
+
+    Alguns agentes/proxies entregam o texto em blocos grandes (ou tudo no fim);
+    isto garante que a resposta aparece SEMPRE em streaming fluido, caracter a
+    caracter, sem alterar o conteudo.
+    """
+    for piece in gen:
+        if not piece:
+            continue
+        if len(piece) <= chunk_chars * 2:
+            yield piece
+            continue
+        for i in range(0, len(piece), chunk_chars):
+            yield piece[i:i + chunk_chars]
+            if delay:
+                time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
 # Composicao da mensagem (memoria + conversa + anexos + web + pergunta)
 # ---------------------------------------------------------------------------
 def _compact_for_context(text: str, cap: int = 6000) -> str:
@@ -1464,6 +1486,30 @@ def build_agent_message(
 
     parts.append("[PERGUNTA ATUAL]\n" + user_prompt)
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Saudacao por hora do dia (hero personalizado)
+# ---------------------------------------------------------------------------
+def greeting_pt(name: str = "") -> str:
+    h = dt.datetime.now().hour
+    if 6 <= h < 13:
+        g = "Bom dia"
+    elif 13 <= h < 20:
+        g = "Boa tarde"
+    else:
+        g = "Boa noite"
+    first = (name or "").strip().split()[0] if (name or "").strip() else ""
+    return f"{g}, {first}" if first else g
+
+
+def date_pt() -> str:
+    wd = ["segunda-feira", "ter\u00e7a-feira", "quarta-feira", "quinta-feira",
+          "sexta-feira", "s\u00e1bado", "domingo"]
+    ms = ["janeiro", "fevereiro", "mar\u00e7o", "abril", "maio", "junho", "julho",
+          "agosto", "setembro", "outubro", "novembro", "dezembro"]
+    n = dt.datetime.now()
+    return f"{wd[n.weekday()]}, {n.day} de {ms[n.month - 1]}"
 
 
 # ---------------------------------------------------------------------------
@@ -1582,6 +1628,22 @@ a{ color:var(--tic); }
 .authwrap{ max-width:420px; margin:.5rem auto 0; }
 .authwrap h3{ font-family:var(--font-display); font-weight:600; font-size:1.4rem; margin-bottom:.2rem; }
 .authwrap p.s{ color:var(--muted); font-size:.85rem; margin-bottom:.4rem; }
+
+/* ------- efeitos ------- */
+@keyframes msgIn{ from{opacity:0; transform:translateY(10px) scale(.992);} to{opacity:1; transform:none;} }
+[data-testid="stChatMessage"]{ animation:msgIn .42s cubic-bezier(.2,.7,.25,1); transition:border-color .2s ease, transform .2s ease; }
+[data-testid="stChatMessage"]:hover{ border-color:var(--line-2); }
+@keyframes dotPulse{ 0%,100%{ box-shadow:0 0 6px 0 currentColor; opacity:.95; } 50%{ box-shadow:0 0 14px 2px currentColor; opacity:1; } }
+.badge .dot{ animation:dotPulse 2.4s ease-in-out infinite; }
+@keyframes reasonSweep{ from{ background-position:-200% 0; } to{ background-position:200% 0; } }
+.reason{ background-image:linear-gradient(100deg, transparent 35%, rgba(255,255,255,.025) 50%, transparent 65%), linear-gradient(var(--bg-3),var(--bg-3)); background-size:200% 100%, 100% 100%; animation:reasonSweep 5s linear infinite; }
+[data-testid="stStatusWidget"], .stSpinner > div{ color:var(--tic) !important; }
+@keyframes scanIn{ from{ transform:scaleX(0); } to{ transform:scaleX(1); } }
+.step::after{ content:""; height:1px; flex:1; background:linear-gradient(90deg,var(--line-2),transparent); transform-origin:left; animation:scanIn .6s ease; }
+::selection{ background:rgba(92,200,232,.28); }
+*::-webkit-scrollbar{ width:10px; height:10px; }
+*::-webkit-scrollbar-thumb{ background:var(--line-2); border-radius:8px; border:2px solid var(--bg); }
+*::-webkit-scrollbar-track{ background:transparent; }
 </style>
 """
 
@@ -1600,6 +1662,10 @@ html,body{height:100%;overflow:hidden;background:#090D13;}
 .eye{font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.32em;
   font-size:10.5px;color:#5A6679;margin-bottom:12px;display:flex;align-items:center;gap:10px;}
 .eye .sq{width:7px;height:7px;border:1px solid #2C3A52;transform:rotate(45deg);}
+.greet{font-family:'JetBrains Mono',monospace;font-size:12.5px;color:#5CC8E8;letter-spacing:.1em;
+  margin-bottom:9px;opacity:0;animation:greetIn .9s ease .15s forwards;}
+.greet .dt{color:#5A6679;}
+@keyframes greetIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
 h1{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:46px;line-height:1;letter-spacing:-1px;}
 h1 .tic{color:#5CC8E8;}
 h1 .x{color:#D2A24C;margin:0 8px;font-weight:500;}
@@ -1623,6 +1689,7 @@ h1 .x{color:#D2A24C;margin:0 8px;font-weight:500;}
 </div>
 <div class="wrap">
   <div class="eye"><span class="sq"></span>Autoeuropa &middot; Technical Innovation Center</div>
+  <div class="greet">__GREETING__</div>
   <h1><span class="tic">TIC</span> Copilot <span class="x">&middot;</span> Claude <span class="x">&times;</span> GPT</h1>
   <div class="sub"><span id="t"></span><span class="cur">_</span></div>
 </div>
@@ -1700,6 +1767,141 @@ function type(){var w=phrases[pi];el.textContent=w.substring(0,ci);
   if(!del){ci++;if(ci>w.length){del=true;setTimeout(type,1600);return;}}
   else{ci--;if(ci<0){del=false;pi=(pi+1)%phrases.length;ci=0;}}
   setTimeout(type,del?26:52);}
+type();
+</script></body></html>
+"""
+
+
+def hero_html(greeting: str, date_str: str = "") -> str:
+    """Hero personalizado: 'Bom dia, Carlos' consoante a hora do dia."""
+    line = greeting + (f" <span class='dt'>&middot; {date_str}</span>" if date_str else "")
+    return HERO_HTML.replace("__GREETING__", line)
+
+
+# ---------------------------------------------------------------------------
+# Pagina de login: fundo aurora animado + particulas que formam "TIC COPILOT"
+# ---------------------------------------------------------------------------
+LOGIN_CSS = """
+<style>
+@keyframes aurora{ 0%{background-position:0% 50%;} 50%{background-position:100% 50%;} 100%{background-position:0% 50%;} }
+.stApp,[data-testid="stAppViewContainer"]{
+  background:linear-gradient(115deg,#090D13 0%,#0A1620 22%,#10222E 42%,#1B1610 62%,#0C1A22 82%,#090D13 100%) !important;
+  background-size:320% 320% !important;
+  animation:aurora 22s ease-in-out infinite;
+}
+@keyframes gridDrift{ from{background-position:0 0,0 0;} to{background-position:56px 56px,56px 56px;} }
+.stApp::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    repeating-linear-gradient(0deg, rgba(92,200,232,0.030) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(90deg, rgba(92,200,232,0.030) 0 1px, transparent 1px 56px);
+  animation:gridDrift 26s linear infinite;
+  mask-image:radial-gradient(900px 600px at 50% 36%, #000 30%, transparent 80%);
+  -webkit-mask-image:radial-gradient(900px 600px at 50% 36%, #000 30%, transparent 80%);
+}
+/* cartao de login em vidro */
+[data-testid="stForm"]{
+  background:rgba(13,18,27,.55) !important;
+  backdrop-filter:blur(16px) saturate(130%);
+  -webkit-backdrop-filter:blur(16px) saturate(130%);
+  border:1px solid rgba(92,200,232,.22) !important;
+  border-radius:18px !important;
+  padding:1.35rem 1.35rem 1.1rem !important;
+  box-shadow:0 30px 70px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);
+  transition:border-color .25s ease, box-shadow .25s ease;
+}
+[data-testid="stForm"]:focus-within{
+  border-color:rgba(92,200,232,.55) !important;
+  box-shadow:0 30px 70px rgba(0,0,0,.55), 0 0 0 4px rgba(92,200,232,.10), inset 0 1px 0 rgba(255,255,255,.06);
+}
+[data-testid="stForm"] .stButton > button,[data-testid="stForm"] button[kind="primaryFormSubmit"],
+[data-testid="stForm"] button[kind="secondaryFormSubmit"]{
+  background:linear-gradient(120deg, rgba(92,200,232,.16), rgba(210,162,76,.14)) !important;
+  border:1px solid rgba(92,200,232,.4) !important; color:#E8EDF5 !important;
+}
+[data-testid="stForm"] button:hover{ border-color:#5CC8E8 !important; box-shadow:0 0 18px rgba(92,200,232,.25); }
+.authwrap{ position:relative; z-index:1; }
+</style>
+"""
+
+LOGIN_HERO_HTML = """
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{height:100%;overflow:hidden;background:transparent;}
+#c{position:absolute;inset:0;cursor:crosshair;}
+.sub{position:absolute;left:0;right:0;bottom:34px;text-align:center;
+  font-family:'JetBrains Mono',monospace;font-size:12px;color:#8B96AB;letter-spacing:.22em;text-transform:uppercase;}
+.sub .cur{color:#5CC8E8;}
+.hint{position:absolute;left:0;right:0;bottom:12px;text-align:center;
+  font-family:'JetBrains Mono',monospace;font-size:10px;color:#5A6679;letter-spacing:.14em;}
+.corner{position:absolute;width:18px;height:18px;border:1px solid #2C3A52;opacity:.85;}
+.corner.tl{top:10px;left:10px;border-right:none;border-bottom:none;}
+.corner.tr{top:10px;right:10px;border-left:none;border-bottom:none;}
+.corner.bl{bottom:10px;left:10px;border-right:none;border-top:none;}
+.corner.br{bottom:10px;right:10px;border-left:none;border-top:none;}
+</style></head><body>
+<canvas id="c"></canvas>
+<div class="corner tl"></div><div class="corner tr"></div><div class="corner bl"></div><div class="corner br"></div>
+<div class="sub"><span id="t"></span><span class="cur">_</span></div>
+<div class="hint">passa o rato pelas particulas &middot; inicia sessao abaixo</div>
+<script>
+var canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
+var W,H,P=[],mouse={x:-9999,y:-9999};
+var COLS=['#5CC8E8','#5CC8E8','#E8EDF5','#D2A24C','#46B98C'];
+function build(){
+  W=canvas.width=canvas.offsetWidth; H=canvas.height=canvas.offsetHeight;
+  var off=document.createElement('canvas'); off.width=W; off.height=H;
+  var o=off.getContext('2d');
+  var fs=Math.min(W/6.4,118);
+  o.fillStyle='#fff';
+  o.font='700 '+fs+'px "Space Grotesk", Arial, sans-serif';
+  o.textAlign='center'; o.textBaseline='middle';
+  o.fillText('TIC COPILOT', W/2, H/2-16);
+  var img=o.getImageData(0,0,W,H).data;
+  var targets=[], gap=Math.max(3,Math.round(fs/30));
+  for(var y=0;y<H;y+=gap){ for(var x=0;x<W;x+=gap){
+    if(img[(y*W+x)*4+3]>140) targets.push([x,y]);
+  }}
+  while(targets.length>3200){ targets.splice(Math.floor(Math.random()*targets.length),1); }
+  P=targets.map(function(t,i){
+    var edge=Math.random();
+    var sx=edge<.5?Math.random()*W:(Math.random()<.5?-30:W+30);
+    var sy=edge<.5?(Math.random()<.5?-30:H+30):Math.random()*H;
+    return {x:sx,y:sy,vx:0,vy:0,tx:t[0],ty:t[1],c:COLS[i%COLS.length],s:1.3+Math.random()*1.1};
+  });
+}
+build();
+window.addEventListener('resize',build);
+if(document.fonts&&document.fonts.ready){document.fonts.ready.then(build);}
+canvas.addEventListener('mousemove',function(e){var r=canvas.getBoundingClientRect();mouse.x=e.clientX-r.left;mouse.y=e.clientY-r.top;});
+canvas.addEventListener('mouseleave',function(){mouse.x=-9999;mouse.y=-9999;});
+var RADIUS=90;
+function step(){
+  ctx.clearRect(0,0,W,H);
+  for(var i=0;i<P.length;i++){
+    var p=P[i];
+    p.vx+=(p.tx-p.x)*0.022; p.vy+=(p.ty-p.y)*0.022;
+    var dx=p.x-mouse.x, dy=p.y-mouse.y, d=Math.sqrt(dx*dx+dy*dy);
+    if(d<RADIUS&&d>0.1){ var f=(RADIUS-d)/RADIUS; p.vx+=(dx/d)*f*3.4; p.vy+=(dy/d)*f*3.4; }
+    p.vx*=0.86; p.vy*=0.86;
+    p.x+=p.vx; p.y+=p.vy;
+    ctx.globalAlpha=0.92;
+    ctx.fillStyle=p.c;
+    ctx.fillRect(p.x,p.y,p.s,p.s);
+  }
+  ctx.globalAlpha=1;
+  requestAnimationFrame(step);
+}
+step();
+var phrases=["Autoeuropa \u00b7 Technical Innovation Center","CAD \u00b7 3D Printing \u00b7 3D Reality",
+  "Claude Opus 4.7 \u00d7 GPT-5.5"];
+var pi=0,ci=0,del=false,el=document.getElementById('t');
+function type(){var w=phrases[pi];el.textContent=w.substring(0,ci);
+  if(!del){ci++;if(ci>w.length){del=true;setTimeout(type,1700);return;}}
+  else{ci--;if(ci<0){del=false;pi=(pi+1)%phrases.length;ci=0;}}
+  setTimeout(type,del?24:50);}
 type();
 </script></body></html>
 """
@@ -1800,9 +2002,9 @@ def handle_single(send_text, display_text, forced_model, show_reason):
         if show_reason:
             head += reason_card(model_key, reason)
         st.markdown(head, unsafe_allow_html=True)
-        full = st.write_stream(respond(model_key, send_text,
-                                       st.session_state.threads[model_key],
-                                       api_key_for(model_key), persist=True))
+        full = st.write_stream(smooth_stream(respond(
+            model_key, send_text, st.session_state.threads[model_key],
+            api_key_for(model_key), persist=True)))
     track_usage(model_key, send_text, full or "")
     st.session_state.messages.append({"role": "assistant", "mode": "single", "model": model_key,
                                       "reason": reason if show_reason else "", "content": full})
@@ -1828,7 +2030,8 @@ def handle_duel(send_text, display_text):
 
         def worker(k):
             try:
-                for tok in respond(k, send_text, tids[k], keys[k], persist=False):
+                for tok in smooth_stream(respond(k, send_text, tids[k], keys[k],
+                                                 persist=False), delay=0.0):
                     qs[k].put(tok)
             except Exception as e:  # noqa
                 qs[k].put(f"\n\n> Erro: {e}")
@@ -1843,18 +2046,18 @@ def handle_duel(send_text, display_text):
             for k in order:
                 updated = False
                 try:
-                    while True:
+                    for _ in range(16):  # lote pequeno por frame -> fluxo suave
                         item = qs[k].get_nowait()
                         if item is None:
                             done[k] = True
                             times[k] = time.time() - starts[k]
-                        else:
-                            results[k] += item
-                            updated = True
+                            break
+                        results[k] += item
+                        updated = True
                 except queue.Empty:
                     pass
                 if updated:
-                    ph[k].markdown(results[k] + " |")
+                    ph[k].markdown(results[k] + " \u258c")
             time.sleep(0.03)
         meta = {}
         for k in order:
@@ -1875,7 +2078,7 @@ def handle_collab(send_text, display_text, do_synthesis):
                     unsafe_allow_html=True)
         st.markdown(reason_card(executor, decision["reason"]), unsafe_allow_html=True)
         st.markdown(step_html(1, f"Rascunho - {MODELS[executor]['label']}"), unsafe_allow_html=True)
-        draft = st.write_stream(respond(executor, send_text, new_thread_id(), ex_key))
+        draft = st.write_stream(smooth_stream(respond(executor, send_text, new_thread_id(), ex_key)))
         critique_prompt = (
             "Es um revisor tecnico critico e rigoroso. Outro assistente respondeu ao pedido "
             "abaixo. Identifica erros factuais, lacunas, ambiguidades, riscos e suposicoes "
@@ -1883,7 +2086,7 @@ def handle_collab(send_text, display_text, do_synthesis):
             f"=== PEDIDO ===\n{display_text}\n\n=== RESPOSTA A REVER ===\n{draft}"
         )
         st.markdown(step_html(2, f"Revisao critica - {MODELS[reviewer]['label']}"), unsafe_allow_html=True)
-        critique = st.write_stream(respond(reviewer, critique_prompt, new_thread_id(), rv_key))
+        critique = st.write_stream(smooth_stream(respond(reviewer, critique_prompt, new_thread_id(), rv_key)))
         synthesis = ""
         if do_synthesis:
             synth_prompt = (
@@ -1893,7 +2096,7 @@ def handle_collab(send_text, display_text, do_synthesis):
                 f"=== REVISAO ===\n{critique}"
             )
             st.markdown(step_html(3, f"Versao final - {MODELS[executor]['label']}"), unsafe_allow_html=True)
-            synthesis = st.write_stream(respond(executor, synth_prompt, new_thread_id(), ex_key))
+            synthesis = st.write_stream(smooth_stream(respond(executor, synth_prompt, new_thread_id(), ex_key)))
     track_usage(executor, send_text, (draft or "") + (synthesis or ""))
     track_usage(reviewer, critique_prompt, critique or "")
     st.session_state.messages.append({"role": "assistant", "mode": "collab", "executor": executor,
@@ -2204,11 +2407,17 @@ def main():
     if "auth" not in st.session_state:
         st.session_state.auth = None
     st.markdown(THEME_CSS, unsafe_allow_html=True)
-    components.html(HERO_HTML, height=240, scrolling=False)
 
     if not st.session_state.auth:
+        # Pagina de login: aurora animada + particulas interativas "TIC COPILOT"
+        st.markdown(LOGIN_CSS, unsafe_allow_html=True)
+        components.html(LOGIN_HERO_HTML, height=330, scrolling=False)
         render_auth()
         return
+
+    # Hero personalizado: "Bom dia / Boa tarde / Boa noite, <nome>"
+    greet = greeting_pt(st.session_state.auth.get("name", ""))
+    components.html(hero_html(greet, date_pt()), height=240, scrolling=False)
 
     username = st.session_state.auth["user"]
     if "messages" not in st.session_state:
