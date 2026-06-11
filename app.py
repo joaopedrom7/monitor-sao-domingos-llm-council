@@ -47,7 +47,7 @@ from pathlib import Path
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-st.set_page_config(page_icon="Gemini_Generated_Image_o58khxo58khxo58k.png")
+
 # ---------------------------------------------------------------------------
 # Dependencias opcionais (extracao/OCR) - degradacao graciosa se faltarem
 # ---------------------------------------------------------------------------
@@ -1489,6 +1489,29 @@ def build_agent_message(
 
 
 # ---------------------------------------------------------------------------
+# Favicon / icone da pagina (imagem personalizada com fallback)
+# ---------------------------------------------------------------------------
+FAVICON_FILE = "Gemini_Generated_Image_o58khxo58khxo58k.png"
+
+
+def page_icon():
+    """Devolve o favicon personalizado se existir; senao, um fallback seguro.
+
+    Procura o ficheiro junto ao app.py e numa pasta /assets opcional.
+    Streamlit aceita um objeto PIL.Image como icone da pagina/separador.
+    """
+    candidates = [APP_DIR / FAVICON_FILE, APP_DIR / "assets" / FAVICON_FILE]
+    if HAS_PIL:
+        for p in candidates:
+            if p.exists():
+                try:
+                    return Image.open(p)
+                except Exception:
+                    pass
+    return "\u25c6"  # losango (fallback)
+
+
+# ---------------------------------------------------------------------------
 # Saudacao por hora do dia (hero personalizado)
 # ---------------------------------------------------------------------------
 def greeting_pt(name: str = "") -> str:
@@ -2399,7 +2422,7 @@ def render_voice_input(whisper_size: str):
 # UI principal
 # ---------------------------------------------------------------------------
 def main():
-    st.set_page_config(page_title="TIC Copilot — Claude x GPT", page_icon="◆", layout="wide")
+    st.set_page_config(page_title="TIC Copilot — Claude x GPT", page_icon=page_icon(), layout="wide")
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
     if "audio_key" not in st.session_state:
