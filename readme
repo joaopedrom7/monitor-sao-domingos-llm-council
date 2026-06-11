@@ -1,0 +1,58 @@
+# TIC Copilot — Claude × GPT (IAedu)
+
+Assistente multi-modelo para o Technical Innovation Center (CAD, 3D Printing,
+3D Reality, Mendix). Roteia cada pedido para o modelo mais forte (Claude
+Opus 4.7 vs GPT-5.5), com modos Duelo e Colaboração.
+
+## Instalar
+
+```bash
+pip install -r requirements.txt
+# OCR (texto em imagens / PDFs digitalizados):
+sudo apt-get install tesseract-ocr tesseract-ocr-por
+```
+
+## Configurar
+
+Variáveis de ambiente (ou `.streamlit/secrets.toml`):
+
+| Variável | Obrigatória | Para quê |
+|---|---|---|
+| `IAEDU_CLAUDE_KEY` | sim | Agente Claude Opus 4.7 (IAedu) |
+| `IAEDU_GPT_KEY` | sim | Agente GPT-5.5 (IAedu) |
+| `HF_TOKEN` | não | VLM gratuito (Qwen2.5-VL via Hugging Face) para interpretar imagens. Token gratuito em huggingface.co/settings/tokens |
+
+## Correr
+
+```bash
+streamlit run app.py
+```
+
+## Funcionalidades
+
+- **Histórico de conversas** persistente por utilizador: retomar, apagar,
+  exportar para Markdown. O índice RAG de cada conversa também é gravado.
+- **RAG híbrido SOTA** sobre anexos: BM25 + embeddings densos (FAISS),
+  fusão por Reciprocal Rank Fusion, reranker neural opcional (cross-encoder).
+  Degrada graciosamente se faltar uma das vias.
+- **Imagens**: OCR (tesseract) **e** interpretação por VLM gratuito
+  (Qwen2.5-VL-7B via Hugging Face router) — diagramas, peças, screenshots Mendix.
+- **Pesquisa web** sem chave (DuckDuckGo) com leitura das primeiras páginas e
+  fontes citáveis; dispara automaticamente quando o roteador deteta "info atual",
+  ou sempre/nunca conforme a opção na barra lateral.
+- **Entrada por voz**: gravação no browser + transcrição local com
+  faster-whisper (tiny/base/small), editável antes de enviar.
+- **Ações rápidas TIC**: prompts prontos para alocação automática em Mendix,
+  otimização da fila de impressão 3D, estruturação do departamento, revisão
+  de requisitos.
+- **Roteamento com regras TIC**: Mendix/low-code, CAD/impressão 3D/AR-VR e
+  liderança de equipas, além das regras por benchmark.
+- **Dashboard de custos** da sessão, memória master por utilizador,
+  Duelo lado-a-lado e Colaboração executor→revisor→síntese.
+
+## Notas
+
+- O modelo Whisper e os modelos de embeddings são descarregados na primeira
+  utilização (uma vez por máquina).
+- Em CPU, o reranker neural e embeddings grandes (bge-m3) podem demorar alguns
+  segundos em documentos muito longos — o reranker é opcional por isso mesmo.
