@@ -9,3 +9,23 @@ numpy>=1.26
 sentence-transformers>=3.0
 faiss-cpu>=1.8
 torch>=2.2
+streamlit>=1.40
+requests
+
+# Extracao de documentos + OCR
+pymupdf
+python-pptx
+pillow
+pytesseract            # requer o binario do sistema: tesseract-ocr tesseract-ocr-por
+
+# RAG hibrido (denso + lexical)
+numpy
+faiss-cpu
+sentence-transformers
+rank-bm25
+
+# Pesquisa web (DuckDuckGo, sem chave de API)
+ddgs
+
+# Speech-to-text local (gratuito)
+faster-whisper
